@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.trae/
+output/
+paper/
+run_with_key.py
+test_cropping.py
+test_zhipuai.py
