@@ -68,28 +68,12 @@ def main():
     print(f"  Expanding {len(mandatory_raw)} mandatory keywords (Strict)...")
     expanded_mandatory = agent.expand_keywords_batch(mandatory_raw, mode="strict")
     
-    # Batch Expand Bonus (Semantic Mode)
-    print(f"  Expanding {len(bonus_raw)} bonus keywords (Semantic)...")
-    expanded_bonus = []
-    if bonus_raw:
-        # expand_keywords_batch returns dict, but filter_by_keywords expects a list for bonus (since we don't group them yet)
-        # Actually, let's check filter_by_keywords signature. It takes expanded_bonus.
-        # But filter_by_keywords doesn't use expanded_bonus yet (comment said "Bonus keywords are ignored in this hard filter phase").
-        # However, score_relevance uses raw bonus strings.
-        # Wait, filter_by_keywords definition: `def filter_by_keywords(papers, expanded_mandatory, expanded_bonus):`
-        # But inside it: `(Bonus keywords are ignored in this hard filter phase...)`
-        # So we might not need expanded bonus for filtering, but maybe for highlighting?
-        # Let's keep it as a flat list for now if needed later, or just use the batch dict values.
-        
-        bonus_dict = agent.expand_keywords_batch(bonus_raw, mode="semantic")
-        # Flatten values
-        for v_list in bonus_dict.values():
-            expanded_bonus.extend(v_list)
-        # Deduplicate
-        expanded_bonus = list(set(expanded_bonus))
-        
+    # Bonus keywords are not expanded to save time, using raw keywords instead.
+    print(f"  Skipping expansion for {len(bonus_raw)} bonus keywords.")
+    expanded_bonus = bonus_raw
+            
     print(f"  Expanded Mandatory: {expanded_mandatory}")
-    print(f"  Expanded Bonus: {expanded_bonus}")
+    print(f"  Bonus (Raw): {expanded_bonus}")
     
     # Flatten mandatory for arXiv search query (OR logic between all mandatory terms? No, usually AND between groups)
     # For arXiv query, we just take the first term of each mandatory group + first term of bonus?
@@ -240,9 +224,21 @@ def main():
             filename = os.path.basename(pdf_path)
             
             # Node 1: Metadata Extraction
-            metadata = extract_text_and_metadata(pdf_path)
-            title = metadata["title"]
-            abstract = metadata["abstract"]
+            raw_metadata = extract_text_and_metadata(pdf_path)
+            # In local mode, prioritize the title from PDF content over the filename.
+            title = raw_metadata.get("title") if raw_metadata.get("title") and "Error" not in raw_metadata.get("title") else os.path.basename(pdf_path)
+            abstract = raw_metadata.get("abstract", "")
+
+            # If abstract is still empty in local mode, use the first page's text.
+            if not abstract or len(abstract) < 100:
+                import fitz
+                try:
+                    doc = fitz.open(pdf_path)
+                    first_page_text = doc[0].get_text("text")
+                    doc.close()
+                    abstract = first_page_text[:2000] # Use first 2000 chars as abstract
+                except Exception as e:
+                    print(f"Could not extract fallback text from {pdf_path}: {e}")
             
             # Phase 2b: Strict Re-Scoring (Deep Analysis)
             # Metadata scoring (Phase 1) was fast/rough. Now we have full abstract from PDF (sometimes better).

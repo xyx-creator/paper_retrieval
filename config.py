@@ -16,7 +16,7 @@ INPUT_DIR = os.path.join(BASE_DIR, "paper")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 
 # Constants
-RELEVANCE_THRESHOLD = 8
+RELEVANCE_THRESHOLD = 7
 FIGURE_KEYWORDS = ["Figure 1", "Overview", "Architecture", "Framework", "Pipeline"]
 KEYWORDS = {
     "mandatory": ["Vision-Language Models", "Hallucination"],

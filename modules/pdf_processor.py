@@ -145,21 +145,26 @@ def crop_specific_figure(pdf_path, target_figure_id, captions, output_dir=OUTPUT
         final_crop_rect = final_crop_rect & page.rect
 
     else:
-        # Fallback: Text Gap Heuristic (Improved)
+        # Fallback: Text Gap Heuristic, constrained by caption column
         print("No vector/image objects found. Using Text Gap fallback.")
         text_blocks = page.get_text("blocks")
         bottom = caption_rect.y0
         
-        candidates_above = []
-        for block in text_blocks:
-            b_rect = fitz.Rect(block[:4])
-            if b_rect.y1 < bottom - 5: # Strictly above with buffer
-                candidates_above.append(b_rect.y1)
+        # Find the highest point of any text block strictly above the caption
+        candidates_y1 = [b[3] for b in text_blocks if fitz.Rect(b[:4]).y1 < bottom - 5]
+        top = max(candidates_y1) if candidates_y1 else 0
         
-        top = max(candidates_above) if candidates_above else 0
+        # HORIZONTAL FIX: Define the crop area based on the caption's horizontal
+        # position, not the full page width. Add some padding.
+        h_padding = 20
+        left = max(0, caption_rect.x0 - h_padding)
+        right = min(page.rect.width, caption_rect.x1 + h_padding)
         
-        # Fallback to full width if no objects detected
-        final_crop_rect = fitz.Rect(0, top, page.rect.width, bottom)
+        # Create a crop box constrained to the inferred column.
+        final_crop_rect = fitz.Rect(left, top, right, bottom)
+        
+        # Ensure the box is within the page boundaries.
+        final_crop_rect = final_crop_rect & page.rect
 
     # Sanity Check: Height
     if final_crop_rect.height < 20:
@@ -198,56 +203,76 @@ def crop_specific_figure(pdf_path, target_figure_id, captions, output_dir=OUTPUT
 # Keep the old function for compatibility if needed, but we probably won't use it.
 def extract_text_and_metadata(pdf_path):
     """
-    Extracts the title and abstract from the first page of the PDF.
+    Extracts the title and abstract from the first page of the PDF using a robust method.
     """
     try:
         doc = fitz.open(pdf_path)
         page = doc[0]
-        text = page.get_text("text")
         
-        lines = text.split('\n')
-        title = lines[0] # Fallback
-        
-        blocks = page.get_text("dict")["blocks"]
+        # --- Robust Title Extraction ---
+        dict_blocks = page.get_text("dict")["blocks"]
         max_size = 0
-        title_text = ""
-        for block in blocks:
-            if "lines" not in block: continue
-            for line in block["lines"]:
-                for span in line["spans"]:
-                    text = span["text"].strip()
-                    if not text: continue
-                    
-                    # Heuristic: Ignore arXiv stamp or dates even if large
-                    if text.lower().startswith("arxiv:") or text.startswith("http") or "cs.CV" in text:
-                        continue
-                        
-                    if span["size"] > max_size:
-                        max_size = span["size"]
-                        title_text = text
-                    elif span["size"] == max_size:
-                        title_text += " " + text
-        
-        if title_text:
-            title = title_text.strip()
+        title_block_no = -1
 
+        # Find the block number with the largest font size, assuming it's the title
+        for b in dict_blocks:
+            if b['type'] == 0 and "lines" in b:  # 0 is a text block
+                for line in b["lines"]:
+                    for span in line["spans"]:
+                        text = span["text"].strip()
+                        # Simple heuristic to avoid picking up headers/footers
+                        if "arxiv" in text.lower() or "http" in text.lower() or "cs.cv" in text.lower():
+                            continue
+                        if span["size"] > max_size:
+                            max_size = span["size"]
+                            title_block_no = b["number"]
+
+        title = ""
+        if title_block_no != -1:
+            # Extract the full, properly formatted text from the identified title block
+            text_blocks = page.get_text("blocks")
+            for b in text_blocks:
+                if b[5] == title_block_no:
+                    # Replace newlines with spaces for a clean, single-line title
+                    title = b[4].replace('\n', ' ').strip()
+                    break
+        
+        # Fallback if the above logic fails
+        if not title:
+            # Fallback to the first non-empty line of the page
+            full_text = page.get_text("text")
+            lines = full_text.split('\n')
+            for line in lines:
+                if line.strip():
+                    title = line.strip()
+                    break
+            if not title:
+                 title = "Title not found" # Ultimate fallback
+
+        # --- Abstract Extraction (with improvements) ---
+        text = page.get_text("text")
         abstract = ""
-        abstract_match = re.search(r'(?i)abstract[:\s]*(.*?)(?:\n\s*(?:introduction|1\.))', text, re.DOTALL)
+        # Regex to find abstract, stopping at "introduction" or "1." (case-insensitive)
+        abstract_match = re.search(r'(?i)abstract[:\s]*(.*?)(?:\n\s*(?:introduction|1\.|i\.\s*ntroduction))', text, re.DOTALL)
         if abstract_match:
-            abstract = abstract_match.group(1).strip()
+            abstract = abstract_match.group(1).strip().replace('\n', ' ')
         else:
+            # Fallback if regex fails
             start_idx = text.lower().find("abstract")
             if start_idx != -1:
                 end_idx = text.lower().find("introduction", start_idx)
+                if end_idx == -1:
+                    end_idx = text.lower().find("1.", start_idx)
                 if end_idx != -1:
-                    abstract = text[start_idx:end_idx].strip()
+                    abstract = text[start_idx+8:end_idx].strip().replace('\n', ' ')
                 else:
-                    abstract = text[start_idx:start_idx+1000].strip()
-        
+                    # Grab a chunk of text if no end is found
+                    abstract = text[start_idx+8:start_idx+1500].strip().replace('\n', ' ')
+
         return {
             "title": title,
             "abstract": abstract if abstract else "Abstract not found."
         }
     except Exception as e:
         print(f"Error processing {pdf_path}: {e}")
-        return {"title": "Error", "abstract": ""}
+        return {"title": "Error extracting title", "abstract": ""}
