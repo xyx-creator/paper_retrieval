@@ -11,7 +11,7 @@ from modules.paper_source import search_arxiv, search_semantic_scholar, filter_b
 
 def main():
     parser = argparse.ArgumentParser(description="GLM Dual-Brain Paper Retrieval Agent")
-    parser.add_argument("--source", choices=["local", "arxiv", "s2", "dblp"], default="local", help="Paper source")
+    parser.add_argument("--source", choices=["local", "arxiv", "dblp"], default="local", help="Paper source")
     parser.add_argument("--days", type=int, default=1, help="Number of days to search (arXiv)")
     parser.add_argument("--venue", type=str, help="Venue for Semantic Scholar/DBLP (e.g., CVPR)")
     parser.add_argument("--year", type=int, help="Year for Semantic Scholar/DBLP")
