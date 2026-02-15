@@ -6,5 +6,7 @@ __pycache__/
 output/
 paper/
 run_with_key.py
-test_cropping.py
-test_zhipuai.py
+test_*.py
+*.pdf
+*.log
+.DS_Store
