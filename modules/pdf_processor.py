@@ -12,7 +12,13 @@ def extract_all_captions(pdf_path):
     captions = []
     try:
         doc = fitz.open(pdf_path)
+        # Limit to first 15 pages to speed up
+        max_pages = 15
+        
         for page_num, page in enumerate(doc):
+            if page_num >= max_pages:
+                break
+                
             text_blocks = page.get_text("blocks")
             # blocks: (x0, y0, x1, y1, "lines\n...", block_no, block_type)
             
@@ -34,10 +40,16 @@ def extract_all_captions(pdf_path):
         print(f"Error extracting captions from {pdf_path}: {e}")
         return []
 
-def crop_specific_figure(pdf_path, target_figure_id, captions):
+def crop_specific_figure(pdf_path, target_figure_id, captions, output_dir=OUTPUT_DIR):
     """
     Crops the specific figure identified by target_figure_id (e.g., "Figure 1").
     Uses drawing/image detection first, then text gap fallback.
+    
+    Args:
+        pdf_path (str): Path to PDF file.
+        target_figure_id (str): ID of the figure to crop (e.g. "Figure 1").
+        captions (list): List of caption dicts.
+        output_dir (str): Directory to save the cropped image. Defaults to global OUTPUT_DIR.
     """
     # Find the target caption in the list
     target_caption = None
@@ -75,6 +87,10 @@ def crop_specific_figure(pdf_path, target_figure_id, captions):
     # 1. Check Drawings (Vector Graphics)
     for draw in drawings:
         r = draw["rect"]
+        # Ignore full-page background rectangles (common in PDFs)
+        if r.width > page.rect.width * 0.95 and r.height > page.rect.height * 0.95:
+            continue
+            
         if r.intersects(search_rect):
             # Check if it is *strictly* above the caption (with small overlap allowed)
             if r.y1 <= caption_rect.y0 + 10: 
@@ -118,10 +134,15 @@ def crop_specific_figure(pdf_path, target_figure_id, captions):
                 pass
                 
         # Add some padding
-        final_crop_rect = union_rect + (-10, -10, 10, 10) # (x0, y0, x1, y1) expansion
+        padding = 10
+        final_crop_rect = union_rect + (-padding, -padding, padding, padding) # (x0, y0, x1, y1) expansion
+        
         # Ensure it doesn't overlap caption too much
         if final_crop_rect.y1 > caption_rect.y0:
             final_crop_rect.y1 = caption_rect.y0
+            
+        # Ensure it doesn't go off-page
+        final_crop_rect = final_crop_rect & page.rect
 
     else:
         # Fallback: Text Gap Heuristic (Improved)
@@ -137,9 +158,7 @@ def crop_specific_figure(pdf_path, target_figure_id, captions):
         
         top = max(candidates_above) if candidates_above else 0
         
-        # If top is too high (e.g. header), but figure is small?
-        # We can't know. We assume figure takes all space.
-        
+        # Fallback to full width if no objects detected
         final_crop_rect = fitz.Rect(0, top, page.rect.width, bottom)
 
     # Sanity Check: Height
@@ -161,8 +180,11 @@ def crop_specific_figure(pdf_path, target_figure_id, captions):
     if pix.width < 10 or pix.height < 10:
          return None
 
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
     output_filename = f"{os.path.basename(pdf_path)}_{target_figure_id.replace(' ', '_')}.png"
-    output_path = os.path.join(OUTPUT_DIR, output_filename)
+    output_path = os.path.join(output_dir, output_filename)
     pix.save(output_path)
     
     # Double check with PIL if it's all white (optional but good)
@@ -193,11 +215,18 @@ def extract_text_and_metadata(pdf_path):
             if "lines" not in block: continue
             for line in block["lines"]:
                 for span in line["spans"]:
+                    text = span["text"].strip()
+                    if not text: continue
+                    
+                    # Heuristic: Ignore arXiv stamp or dates even if large
+                    if text.lower().startswith("arxiv:") or text.startswith("http") or "cs.CV" in text:
+                        continue
+                        
                     if span["size"] > max_size:
                         max_size = span["size"]
-                        title_text = span["text"]
+                        title_text = text
                     elif span["size"] == max_size:
-                        title_text += " " + span["text"]
+                        title_text += " " + text
         
         if title_text:
             title = title_text.strip()

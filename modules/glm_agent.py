@@ -1,6 +1,6 @@
 import base64
 from zhipuai import ZhipuAI
-from config import ZHIPUAI_API_KEY, MODEL_TEXT, MODEL_VISION
+from config import ZHIPUAI_API_KEY, MODEL_TEXT, MODEL_VISION, MODEL_KEYWORD_EXPANSION
 
 class GLMAgent:
     def __init__(self):
@@ -12,25 +12,135 @@ class GLMAgent:
         with open(image_path, "rb") as image_file:
             return base64.b64encode(image_file.read()).decode('utf-8')
 
-    def score_relevance(self, abstract, keywords):
+    def expand_keywords_batch(self, keywords, mode="strict"):
         """
-        Node 2: Score relevance of the paper based on abstract and keywords.
-        Returns int (1-5).
+        Step 0: Use GLM-4-Air to expand MULTIPLE keywords in a single batch call.
+        Returns a dictionary: {original_keyword: [expansions]}
+        """
+        if not keywords:
+            return {}
+            
+        keywords_str = ", ".join(keywords)
+        
+        if mode == "strict":
+            prompt = f"""
+            You are a linguistic assistant.
+            Keywords List: {keywords_str}
+            
+            Task: For EACH keyword in the list, generate grammatical variations ONLY (plural, singular, tense, hyphenation, abbreviation).
+            Do NOT generate synonyms or related concepts.
+            
+            Constraint: Return MAX 3 variations per keyword.
+            
+            Output Format:
+            Keyword1: Var1, Var2
+            Keyword2: Var1, Var2
+            ...
+            """
+        else:
+            prompt = f"""
+            You are a research assistant.
+            Keywords List: {keywords_str}
+            
+            Task: For EACH keyword in the list, expand into synonyms, acronyms, and related academic terms.
+            
+            Constraint: Return MAX 5 most relevant terms per keyword.
+            
+            Output Format:
+            Keyword1: Syn1, Syn2, Syn3
+            Keyword2: Syn1, Syn2, Syn3
+            ...
+            """
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=MODEL_KEYWORD_EXPANSION,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3 if mode == "strict" else 0.7
+            )
+            content = response.choices[0].message.content.strip()
+            
+            # Parse output
+            result = {}
+            lines = content.split('\n')
+            for line in lines:
+                if ':' in line:
+                    parts = line.split(':', 1)
+                    key = parts[0].strip()
+                    # Check if key matches one of our inputs (fuzzy match or exact?)
+                    # Let's try to map back to original input list
+                    matched_original = None
+                    for k in keywords:
+                        if k.lower() == key.lower() or key.lower() in k.lower(): # Simple matching
+                            matched_original = k
+                            break
+                    
+                    if not matched_original:
+                        # Fallback: just use the key from LLM if we can't match strictly
+                        # But caller expects keys to match input list for logic.
+                        # Let's trust the LLM output keys mostly match input.
+                        matched_original = key
+
+                    vars_str = parts[1].strip()
+                    variations = [v.strip() for v in vars_str.split(',') if v.strip()]
+                    
+                    # Ensure original is in list
+                    if matched_original not in variations:
+                        variations.insert(0, matched_original)
+                        
+                    result[matched_original] = variations
+            
+            # Ensure all input keywords have entries
+            for k in keywords:
+                if k not in result:
+                    result[k] = [k]
+                    
+            return result
+            
+        except Exception as e:
+            print(f"Error in expand_keywords_batch: {e}")
+            # Fallback: return original as single expansion
+            return {k: [k] for k in keywords}
+
+    def expand_keywords(self, keywords, mode="strict"):
+        # Deprecated wrapper for single list usage, redirects to batch but returns flat list?
+        # Actually, the old signature took a list and returned a flat list.
+        # But our new main.py calls this in a loop.
+        # We are replacing the loop in main.py, so we can deprecate this or keep for backward compat.
+        # Let's keep it but implement via batch logic for simplicity?
+        # No, let's just stick to the requested plan: Update main.py to use batch.
+        pass
+
+    def score_relevance(self, abstract, mandatory_keywords, bonus_keywords):
+        """
+        Node 2 / Phase 2: Score relevance based on tiered keywords.
+        Returns int (1-10).
         """
         prompt = f"""
-        You are a strict academic relevance scorer.
-        Keywords: {keywords}
-        Abstract: {abstract}
+        You are a CRITICAL Academic Reviewer.
+        MANDATORY Keywords (Must Match): {mandatory_keywords}
+        BONUS Keywords (Boost Score): {bonus_keywords}
+        Paper Abstract: {abstract}
         
-        Task: Rate the relevance of the abstract to the keywords on a scale of 1-5.
+        Task: Rate relevance (1-10).
         
-        Scoring Criteria:
-        5: Highly Relevant. Core contribution revolves around the keywords.
-        4: Relevant. Uses the technology as a key component.
-        3: Mentioned. Referenced in background or baselines.
-        1-2: Irrelevant.
-        
-        Output ONLY the integer score (e.g., 5). Do not output any explanation.
+        SCORING LOGIC:
+        1. **Mandatory Check**: 
+           - Does the paper address ALL mandatory keywords? 
+           - If NO -> Score < 5 (Irrelevant).
+           
+        2. **Base Score (If Mandatory Met)**:
+           - **Score 6-7**: Matches mandatory keywords but is a standard application.
+           - **Score 8**: Matches mandatory keywords + novel contribution.
+           
+        3. **Bonus Boost**:
+           - If paper ALSO addresses BONUS keywords (e.g., "{bonus_keywords}"), ADD +1 to +2 points.
+           - Max Score: 10.
+           
+        4. **Penalties**:
+           - Niche application without core improvement: -1 point.
+           
+        Output ONLY the integer score.
         """
         
         try:
@@ -40,12 +150,11 @@ class GLMAgent:
                 temperature=0.1
             )
             content = response.choices[0].message.content.strip()
-            # Extract number
             import re
-            match = re.search(r'\d', content)
+            match = re.search(r'\d+', content)
             if match:
                 return int(match.group(0))
-            return 1 # Default to low relevance if parsing fails
+            return 1
         except Exception as e:
             print(f"Error in score_relevance: {e}")
             return 1
@@ -181,36 +290,41 @@ class GLMAgent:
         {vision_analysis}
         
         Context:
-        - Relevance Score: {relevance_score}/5
+        - Relevance Score: {relevance_score}/10
         - Keywords: {keywords}
         
         Task:
         Generate a structured report strictly following the format below. 
         Cross-validate the "Method Description" by combining Text Claims with Visual Facts to ensure accuracy.
         
+        IMPORTANT: Do NOT include markdown code block indicators (like ```markdown or ```) in your output. Just output the raw markdown text directly.
+        
         Required Output Format (Markdown):
         
-        ## 1. 基本信息
-        * **年份/等级**: [Extract from Source 1]
-        * **相关度打分**: {relevance_score} / 5 分 (关键词: {keywords})
-        * **原文链接**: [Extract from Source 1 or "Unknown"]
+        ## 1. Basic Information
+        * **Year/Venue**: [Extract from Source 1]
+        * **Relevance Score**: {relevance_score} / 10 (Keywords: {keywords})
+        * **Paper Link**: [Extract from Source 1 or "Unknown"]
         
-        ## 2. 研究背景
-        * **核心动机**: [Extract from Source 1: Motivation]
+        ## 2. Background
+        * **Core Motivation**: [Extract from Source 1: Motivation]
         
-        ## 3. 核心架构与方法解析
+        ## 3. Core Architecture and Method
         
-        * **方法简述**: [Synthesize Source 1 (Modules/Flow) and Source 2 (Visuals). Explain how data flows through the core modules shown in the figure. Be concise and factual. Do NOT list discrepancies explicitly here, just output the corrected/verified explanation.]
+        * **Method Description**: [Synthesize Source 1 (Modules/Flow) and Source 2 (Visuals). Explain how data flows through the core modules shown in the figure. Be concise and factual. Do NOT list discrepancies explicitly here, just output the corrected/verified explanation.]
         
-        ## 4. 实验表现
-        * **验证任务**: [Extract from Source 1: Validation Tasks]
-        * **核心结论**: [Extract from Source 1: Core Conclusion]
+        ## 4. Experimental Performance
+        * **Validation Tasks**: [Extract from Source 1: Validation Tasks]
+        * **Core Conclusion**: [Extract from Source 1: Core Conclusion]
         """
         try:
             response = self.client.chat.completions.create(
                 model=MODEL_TEXT,
                 messages=[{"role": "user", "content": prompt}]
             )
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
+            # Post-processing to remove markdown code blocks if the model still includes them
+            content = content.replace("```markdown", "").replace("```", "").strip()
+            return content
         except Exception as e:
             return f"Error in synthesis: {e}"
