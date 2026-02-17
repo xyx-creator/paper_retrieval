@@ -1,330 +1,438 @@
+"""GLM Agent（LangChain 重构版）。
+
+重构目标：
+1. 使用 LangChain 聊天模型接口替代原生 SDK 直调；
+2. 使用结构化输出（Pydantic）替代正则解析；
+3. 保留原有“双脑分析”方法接口，确保主流程调用方式稳定。
+"""
+
+from __future__ import annotations
+
 import base64
-from zhipuai import ZhipuAI
-from config import ZHIPUAI_API_KEY, MODEL_TEXT, MODEL_VISION, MODEL_KEYWORD_EXPANSION
+import json
+import mimetypes
+import re
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Type, TypeVar, Union
+
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel
+
+from config import (
+    MODEL_KEYWORD_EXPANSION,
+    MODEL_TEXT,
+    MODEL_VISION,
+    ZHIPUAI_API_KEY,
+)
+from modules.output_models import (
+    FigureSelectionOutput,
+    KeywordExpansionOutput,
+    RelevanceScoreOutput,
+    SynthesisOutput,
+    TextBrainOutput,
+    VisionBrainOutput,
+)
+from modules.prompts import (
+    FIGURE_SELECTION_PROMPT,
+    KEYWORD_EXPANSION_BROAD_PROMPT,
+    KEYWORD_EXPANSION_STRICT_PROMPT,
+    RELEVANCE_SCORING_PROMPT,
+    SYNTHESIS_PROMPT,
+    TEXT_BRAIN_PROMPT,
+    VISION_BRAIN_PROMPT,
+)
+
+OutputModelT = TypeVar("OutputModelT", bound=BaseModel)
+
 
 class GLMAgent:
-    def __init__(self):
-        if not ZHIPUAI_API_KEY:
-            raise ValueError("ZHIPUAI_API_KEY not found in environment variables.")
-        self.client = ZhipuAI(api_key=ZHIPUAI_API_KEY)
+    """基于 LangChain 的双脑 Agent。
 
-    def _encode_image(self, image_path):
-        with open(image_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
+    说明：
+    - 文本任务（关键词扩展/打分/融合）统一走文本模型；
+    - 视觉任务（架构图解析）走视觉模型；
+    - 所有关键输出都走 Pydantic 结构化校验，避免 fragile 正则。
+    """
 
-    def expand_keywords_batch(self, keywords, mode="strict"):
-        """
-        Step 0: Use GLM-4-Air to expand MULTIPLE keywords in a single batch call.
-        Returns a dictionary: {original_keyword: [expansions]}
-        """
-        if not keywords:
-            return {}
-            
-        keywords_str = ", ".join(keywords)
-        
-        if mode == "strict":
-            prompt = f"""
-            You are a linguistic assistant.
-            Keywords List: {keywords_str}
-            
-            Task: For EACH keyword in the list, generate grammatical variations ONLY (plural, singular, tense, hyphenation, abbreviation).
-            Do NOT generate synonyms or related concepts.
-            
-            Constraint: Return MAX 3 variations per keyword.
-            
-            Output Format:
-            Keyword1: Var1, Var2
-            Keyword2: Var1, Var2
-            ...
-            """
-        else:
-            prompt = f"""
-            You are a research assistant.
-            Keywords List: {keywords_str}
-            
-            Task: For EACH keyword in the list, expand into synonyms, acronyms, and related academic terms.
-            
-            Constraint: Return MAX 5 most relevant terms per keyword.
-            
-            Output Format:
-            Keyword1: Syn1, Syn2, Syn3
-            Keyword2: Syn1, Syn2, Syn3
-            ...
-            """
-        
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or ZHIPUAI_API_KEY
+        if not self.api_key:
+            raise ValueError("ZHIPUAI_API_KEY 未配置，无法初始化 GLMAgent。")
+
+        # 分别构建关键词扩展、文本分析、视觉分析模型句柄。
+        # 这样做可以对不同任务设置不同 temperature。
+        self.keyword_llm = self._build_chat_model(
+            model_name=MODEL_KEYWORD_EXPANSION,
+            temperature=0.3,
+        )
+        self.text_llm = self._build_chat_model(
+            model_name=MODEL_TEXT,
+            temperature=0.1,
+        )
+        self.vision_llm = self._build_chat_model(
+            model_name=MODEL_VISION,
+            temperature=0.1,
+        )
+
+    def _build_chat_model(self, model_name: str, temperature: float):
+        """构建聊天模型实例（仅使用 ChatZhipuAI）。"""
+
         try:
-            response = self.client.chat.completions.create(
-                model=MODEL_KEYWORD_EXPANSION,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3 if mode == "strict" else 0.7
-            )
-            content = response.choices[0].message.content.strip()
-            
-            # Parse output
-            result = {}
-            lines = content.split('\n')
-            for line in lines:
-                if ':' in line:
-                    parts = line.split(':', 1)
-                    key = parts[0].strip()
-                    # Check if key matches one of our inputs (fuzzy match or exact?)
-                    # Let's try to map back to original input list
-                    matched_original = None
-                    for k in keywords:
-                        if k.lower() == key.lower() or key.lower() in k.lower(): # Simple matching
-                            matched_original = k
-                            break
-                    
-                    if not matched_original:
-                        # Fallback: just use the key from LLM if we can't match strictly
-                        # But caller expects keys to match input list for logic.
-                        # Let's trust the LLM output keys mostly match input.
-                        matched_original = key
+            from langchain_community.chat_models import ChatZhipuAI  # type: ignore
+        except ImportError as exc:
+            raise ImportError(
+                "未检测到 `langchain_community`，无法使用 ChatZhipuAI。"
+                "请先安装 `langchain-community`。"
+            ) from exc
 
-                    vars_str = parts[1].strip()
-                    variations = [v.strip() for v in vars_str.split(',') if v.strip()]
-                    
-                    # Ensure original is in list
-                    if matched_original not in variations:
-                        variations.insert(0, matched_original)
-                        
-                    result[matched_original] = variations
-            
-            # Ensure all input keywords have entries
-            for k in keywords:
-                if k not in result:
-                    result[k] = [k]
-                    
-            return result
-            
-        except Exception as e:
-            print(f"Error in expand_keywords_batch: {e}")
-            # Fallback: return original as single expansion
-            return {k: [k] for k in keywords}
-
-    def expand_keywords(self, keywords, mode="strict"):
-        # Deprecated wrapper for single list usage, redirects to batch but returns flat list?
-        # Actually, the old signature took a list and returned a flat list.
-        # But our new main.py calls this in a loop.
-        # We are replacing the loop in main.py, so we can deprecate this or keep for backward compat.
-        # Let's keep it but implement via batch logic for simplicity?
-        # No, let's just stick to the requested plan: Update main.py to use batch.
-        pass
-
-    def score_relevance(self, abstract, mandatory_keywords, bonus_keywords):
-        """
-        Node 2 / Phase 2: Score relevance based on tiered keywords.
-        Returns int (1-10).
-        """
-        prompt = f"""
-        You are a CRITICAL Academic Reviewer.
-        MANDATORY Keywords (Must Match): {mandatory_keywords}
-        BONUS Keywords (Boost Score): {bonus_keywords}
-        Paper Abstract: {abstract}
-        
-        Task: Rate relevance (1-10).
-        
-        SCORING LOGIC:
-        1. **Mandatory Check**: 
-           - Does the paper address ALL mandatory keywords? 
-           - If NO -> Score < 5 (Irrelevant).
-           
-        2. **Base Score (If Mandatory Met)**:
-           - **Score 6-7**: Matches mandatory keywords but is a standard application.
-           - **Score 8**: Matches mandatory keywords + novel contribution.
-           
-        3. **Bonus Boost**:
-           - If paper ALSO addresses BONUS keywords (e.g., "{bonus_keywords}"), ADD +1 to +2 points.
-           - Max Score: 10.
-           
-        4. **Penalties**:
-           - Niche application without core improvement: -1 point.
-           
-        Output ONLY the integer score.
-        """
-        
         try:
-            response = self.client.chat.completions.create(
-                model=MODEL_TEXT,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1
+            # 新版本通常使用 api_key 参数。
+            return ChatZhipuAI(
+                model=model_name,
+                api_key=self.api_key,
+                temperature=temperature,
             )
-            content = response.choices[0].message.content.strip()
-            import re
-            match = re.search(r'\d+', content)
-            if match:
-                return int(match.group(0))
-            return 1
-        except Exception as e:
-            print(f"Error in score_relevance: {e}")
-            return 1
+        except TypeError:
+            # 兼容部分版本参数名为 zhipuai_api_key。
+            return ChatZhipuAI(
+                model=model_name,
+                zhipuai_api_key=self.api_key,
+                temperature=temperature,
+            )
 
-    def select_best_figure(self, captions_list):
+    @staticmethod
+    def _normalize_keywords(keywords: Union[str, Sequence[str], None]) -> List[str]:
+        """统一关键词输入格式为字符串列表。"""
+
+        if keywords is None:
+            return []
+        if isinstance(keywords, str):
+            return [k.strip() for k in keywords.split(",") if k.strip()]
+        return [str(k).strip() for k in keywords if str(k).strip()]
+
+    @staticmethod
+    def _clean_json_text(text: str) -> str:
+        """清理模型输出中的 Markdown 包裹，便于 JSON 反序列化。"""
+
+        cleaned = text.strip()
+        cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+        return cleaned
+
+    def _invoke_structured(
+        self,
+        llm: Any,
+        prompt_template: Any,
+        payload: Dict[str, Any],
+        output_model: Type[OutputModelT],
+    ) -> OutputModelT:
+        """统一结构化调用入口。
+
+        实现策略：
+        1. 先走 `with_structured_output`（最稳妥，能直接返回 Pydantic 对象）；
+        2. 若模型端不支持或输出异常，再回退“普通调用 + JSON 解析”。
         """
-        Selects the best figure ID from a list of captions.
-        Input: list of strings (e.g. ["Figure 1: ...", "Figure 2: ..."])
-        Output: str (e.g. "Figure 1") or None
+
+        try:
+            chain = prompt_template | llm.with_structured_output(output_model)
+            result = chain.invoke(payload)
+            if isinstance(result, output_model):
+                return result
+            if isinstance(result, dict):
+                return output_model.model_validate(result)
+        except Exception:
+            pass
+
+        # 回退：普通消息调用 + 手工 JSON 校验。
+        messages = prompt_template.format_messages(**payload)
+        raw = llm.invoke(messages)
+        raw_text = raw.content if hasattr(raw, "content") else str(raw)
+        cleaned = self._clean_json_text(raw_text)
+        return output_model.model_validate_json(cleaned)
+
+    def _encode_image_to_data_url(self, image_path: str) -> str:
+        """将本地图像编码为 data URL，供视觉模型输入。"""
+
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        mime_type, _ = mimetypes.guess_type(image_path)
+        if not mime_type:
+            mime_type = "image/png"
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
+        return f"data:{mime_type};base64,{encoded}"
+
+    @staticmethod
+    def _heuristic_select_best_figure(captions_list: Sequence[str]) -> Optional[str]:
+        """当结构化选图失败时的启发式兜底。
+
+        策略：
+        1. 优先选择包含 Overview/Architecture/Framework/Pipeline/Model 的图；
+        2. 若有 Figure 1 或 Figure 2，优先早期图；
+        3. 最后回退到首个可解析图号。
         """
+
         if not captions_list:
             return None
-            
-        captions_text = "\n".join([f"- {cap}" for cap in captions_list])
-        
-        prompt = f"""
-        You are an expert researcher. Below is a list of figure captions from a paper.
-        
-        {captions_text}
-        
-        Task: Identify the ONE figure that best illustrates the overall MODEL ARCHITECTURE, FRAMEWORK, or PIPELINE of the proposed method.
-        
-        Priority:
-        1. Look for keywords like "Overview", "Architecture", "Framework", "Pipeline", "Model".
-        2. Prefer early figures (Figure 1 or 2) if they match the description.
-        3. Avoid "Ablation", "Results", "Comparison", "Dataset" figures.
-        
-        Output ONLY the Figure ID (e.g., "Figure 1"). Do not output any explanation.
-        If no figure seems relevant to the architecture, output "None".
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=MODEL_TEXT,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1
-            )
-            content = response.choices[0].message.content.strip()
-            # Clean up content to just get "Figure X"
-            import re
-            match = re.search(r'(Figure\s+\d+|Fig\.?\s*\d+)', content, re.IGNORECASE)
-            if match:
-                # Normalize to "Figure X"
-                num = re.search(r'\d+', match.group(0)).group(0)
-                return f"Figure {num}"
-            return None
-        except Exception as e:
-            print(f"Error in select_best_figure: {e}")
+
+        # 预解析所有 caption 的 figure id，便于后续优先级筛选。
+        parsed: List[tuple[str, str]] = []
+        for caption in captions_list:
+            match = re.search(r"(Figure|Fig\.?)\s*(\d+)", caption, re.IGNORECASE)
+            if not match:
+                continue
+            fig = f"Figure {match.group(2)}"
+            parsed.append((fig, caption.lower()))
+
+        if not parsed:
             return None
 
+        priority_keywords = ["overview", "architecture", "framework", "pipeline", "model"]
 
-    def analyze_text_brain(self, abstract, introduction=""):
+        # 先找“关键词命中 + 早期图”
+        for target in ("Figure 1", "Figure 2"):
+            for fig, lower_caption in parsed:
+                if fig == target and any(k in lower_caption for k in priority_keywords):
+                    return fig
+
+        # 再找“关键词命中任意图”
+        for fig, lower_caption in parsed:
+            if any(k in lower_caption for k in priority_keywords):
+                return fig
+
+        # 最后回退首图
+        return parsed[0][0]
+
+    def expand_keywords_batch(
+        self, keywords: Sequence[str], mode: str = "strict"
+    ) -> Dict[str, List[str]]:
+        """批量扩展关键词并返回 `{原词: [变体...]}`。
+
+        参数：
+        - keywords: 原始关键词列表。
+        - mode:
+          - `strict`: 只做词形变化；
+          - `broad`: 可做语义相关扩展。
         """
-        Node 4 (Text Brain): Extract claimed architecture and key metadata from text.
-        """
-        prompt = f"""
-        Based on the following Abstract and Introduction, extract the following information:
-        
-        Abstract: {abstract}
-        Introduction (Snippet): {introduction[:3000]}
-        
-        Tasks:
-        1. Identify the Year and Venue (e.g., CVPR 2024, arXiv 2023) if mentioned. If not found, infer from context or mark "Unknown".
-        2. Identify the ArXiv URL if present in text (unlikely in raw text but check). Mark "Unknown" if not found.
-        3. Summarize the Core Motivation (Pain Points) in one sentence.
-        4. Identify the Validation Tasks/Datasets used (e.g., POPE, MMBench).
-        5. Summarize the Core Conclusion/Performance gains.
-        6. Identify the Core Architecture Modules and Data Flow claimed.
-        
-        Output format (JSON-like structure preferred for parsing, but text is fine):
-        - Year_Venue: ...
-        - ArXiv_URL: ...
-        - Motivation: ...
-        - Validation_Tasks: ...
-        - Core_Conclusion: ...
-        - Core_Modules: ...
-        - Data_Flow: ...
-        """
+
+        normalized = self._normalize_keywords(list(keywords))
+        if not normalized:
+            return {}
+
+        prompt = (
+            KEYWORD_EXPANSION_STRICT_PROMPT
+            if mode == "strict"
+            else KEYWORD_EXPANSION_BROAD_PROMPT
+        )
+        max_variations = 3 if mode == "strict" else 5
+        keywords_text = "\n".join(f"- {k}" for k in normalized)
+
         try:
-            response = self.client.chat.completions.create(
-                model=MODEL_TEXT,
-                messages=[{"role": "user", "content": prompt}]
+            output = self._invoke_structured(
+                llm=self.keyword_llm,
+                prompt_template=prompt,
+                payload={
+                    "keywords_text": keywords_text,
+                    "max_variations": max_variations,
+                },
+                output_model=KeywordExpansionOutput,
             )
-            return response.choices[0].message.content
-        except Exception as e:
-            return f"Error in text analysis: {e}"
+            result = output.to_keyword_dict()
+        except Exception:
+            # 失败兜底：返回原词，确保流程可继续。
+            result = {k: [k] for k in normalized}
 
-    def analyze_vision_brain(self, image_path):
-        """
-        Node 4 (Vision Brain): Describe the image objectively.
-        """
-        base64_image = self._encode_image(image_path)
-        
-        prompt = """
-        Please describe this architecture diagram objectively like a scanner.
-        List the visible module names and the arrows/connections between them.
-        Do NOT hallucinate or infer connections that are not visually present.
-        """
-        
+        # 补齐所有输入词，防止模型漏项导致后续 mandatory 过滤失真。
+        for keyword in normalized:
+            if keyword not in result:
+                result[keyword] = [keyword]
+        return result
+
+    def expand_keywords(self, keywords: Sequence[str], mode: str = "strict") -> List[str]:
+        """兼容旧接口：返回扁平化扩展词列表。"""
+
+        expansions = self.expand_keywords_batch(keywords=keywords, mode=mode)
+        flat: List[str] = []
+        for values in expansions.values():
+            flat.extend(values)
+        # 去重并保持顺序。
+        seen = set()
+        deduped: List[str] = []
+        for item in flat:
+            if item not in seen:
+                seen.add(item)
+                deduped.append(item)
+        return deduped
+
+    def score_relevance(
+        self,
+        abstract: str,
+        mandatory_keywords: Union[str, Sequence[str], None],
+        bonus_keywords: Union[str, Sequence[str], None],
+    ) -> int:
+        """对摘要进行 1-10 相关性打分（结构化输出）。"""
+
+        mandatory_list = self._normalize_keywords(mandatory_keywords)
+        bonus_list = self._normalize_keywords(bonus_keywords)
+
         try:
-            response = self.client.chat.completions.create(
-                model=MODEL_VISION,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": base64_image
-                                }
-                            }
-                        ]
-                    }
+            output = self._invoke_structured(
+                llm=self.text_llm,
+                prompt_template=RELEVANCE_SCORING_PROMPT,
+                payload={
+                    "mandatory_keywords": ", ".join(mandatory_list),
+                    "bonus_keywords": ", ".join(bonus_list),
+                    "abstract": abstract or "",
+                },
+                output_model=RelevanceScoreOutput,
+            )
+            return max(1, min(10, int(output.score)))
+        except Exception:
+            return 1
+
+    def select_best_figure(self, captions_list: Sequence[str]) -> Optional[str]:
+        """从图注中选择最适合展示方法架构的图号。"""
+
+        if not captions_list:
+            return None
+
+        captions_text = "\n".join(f"- {c}" for c in captions_list)
+        try:
+            output = self._invoke_structured(
+                llm=self.text_llm,
+                prompt_template=FIGURE_SELECTION_PROMPT,
+                payload={"captions_text": captions_text},
+                output_model=FigureSelectionOutput,
+            )
+        except Exception:
+            return self._heuristic_select_best_figure(captions_list)
+
+        if not output.figure_id:
+            return self._heuristic_select_best_figure(captions_list)
+
+        # 规范化 "Fig. 1" / "Figure 1" 为统一格式 "Figure 1"。
+        match = re.search(r"(Figure|Fig\.?)\s*(\d+)", output.figure_id, re.IGNORECASE)
+        if not match:
+            return self._heuristic_select_best_figure(captions_list)
+        return f"Figure {match.group(2)}"
+
+    def analyze_text_brain(
+        self, abstract: str, introduction: str = ""
+    ) -> Dict[str, Any]:
+        """文本脑：从摘要与引言抽取结构化关键信息。"""
+
+        payload = {
+            "abstract": abstract or "",
+            "introduction": (introduction or "")[:3000],
+        }
+        try:
+            output = self._invoke_structured(
+                llm=self.text_llm,
+                prompt_template=TEXT_BRAIN_PROMPT,
+                payload=payload,
+                output_model=TextBrainOutput,
+            )
+            return output.model_dump()
+        except Exception as exc:
+            return {
+                "year_venue": "Unknown",
+                "paper_link": "Unknown",
+                "motivation": "",
+                "validation_tasks": [],
+                "core_conclusion": f"Text analysis failed: {exc}",
+                "core_modules": [],
+                "data_flow": "",
+            }
+
+    def analyze_vision_brain(self, image_path: str) -> Dict[str, Any]:
+        """视觉脑：读取图像并输出可见模块与连接关系。"""
+
+        image_data_url = self._encode_image_to_data_url(image_path)
+
+        # 这里复用 prompts.py 中的文本模板，保证提示词集中管理。
+        vision_messages = VISION_BRAIN_PROMPT.format_messages()
+        system_message = vision_messages[0]
+        instruction_text = vision_messages[-1].content
+
+        # LangChain 的多模态输入：HumanMessage.content 使用 list[dict]。
+        messages = [
+            system_message,
+            HumanMessage(
+                content=[
+                    {"type": "text", "text": str(instruction_text)},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
                 ]
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            return f"Error in vision analysis: {e}"
+            ),
+        ]
 
-    def synthesize_report(self, text_analysis, vision_analysis, relevance_score, keywords):
-        """
-        Node 4 (Fusion): Cross-validate and generate final explanation in specific Markdown format.
-        """
-        prompt = f"""
-        You are a Dual-Brain Analyst. 
-        
-        Source 1 (Text Metadata & Claims):
-        {text_analysis}
-        
-        Source 2 (Visual Facts):
-        {vision_analysis}
-        
-        Context:
-        - Relevance Score: {relevance_score}/10
-        - Keywords: {keywords}
-        
-        Task:
-        Generate a structured report strictly following the format below. 
-        Cross-validate the "Method Description" by combining Text Claims with Visual Facts to ensure accuracy.
-        
-        IMPORTANT: Do NOT include markdown code block indicators (like ```markdown or ```) in your output. Just output the raw markdown text directly.
-        
-        Required Output Format (Markdown):
-        
-        ## 1. Basic Information
-        * **Year/Venue**: [Extract from Source 1]
-        * **Relevance Score**: {relevance_score} / 10 (Keywords: {keywords})
-        * **Paper Link**: [Extract from Source 1 or "Unknown"]
-        
-        ## 2. Background
-        * **Core Motivation**: [Extract from Source 1: Motivation]
-        
-        ## 3. Core Architecture and Method
-        
-        * **Method Description**: [Synthesize Source 1 (Modules/Flow) and Source 2 (Visuals). Explain how data flows through the core modules shown in the figure. Be concise and factual. Do NOT list discrepancies explicitly here, just output the corrected/verified explanation.]
-        
-        ## 4. Experimental Performance
-        * **Validation Tasks**: [Extract from Source 1: Validation Tasks]
-        * **Core Conclusion**: [Extract from Source 1: Core Conclusion]
-        """
+        # 先尝试结构化输出，若失败则兜底普通文本。
         try:
-            response = self.client.chat.completions.create(
-                model=MODEL_TEXT,
-                messages=[{"role": "user", "content": prompt}]
+            structured = self.vision_llm.with_structured_output(VisionBrainOutput)
+            output = structured.invoke(messages)
+            if isinstance(output, VisionBrainOutput):
+                return output.model_dump()
+            if isinstance(output, dict):
+                return VisionBrainOutput.model_validate(output).model_dump()
+        except Exception:
+            pass
+
+        try:
+            raw = self.vision_llm.invoke(messages)
+            content = raw.content if hasattr(raw, "content") else str(raw)
+            return {
+                "visible_modules": [],
+                "visible_connections": [],
+                "notes": str(content),
+            }
+        except Exception as exc:
+            return {
+                "visible_modules": [],
+                "visible_connections": [],
+                "notes": f"Vision analysis failed: {exc}",
+            }
+
+    def synthesize_report(
+        self,
+        text_analysis: Union[str, Dict[str, Any]],
+        vision_analysis: Union[str, Dict[str, Any]],
+        relevance_score: int,
+        keywords: Union[str, Sequence[str], None],
+    ) -> str:
+        """融合文本脑与视觉脑结果，生成最终 Markdown 段落。"""
+
+        if isinstance(text_analysis, str):
+            text_payload = text_analysis
+        else:
+            text_payload = json.dumps(text_analysis, ensure_ascii=False, indent=2)
+
+        if isinstance(vision_analysis, str):
+            vision_payload = vision_analysis
+        else:
+            vision_payload = json.dumps(vision_analysis, ensure_ascii=False, indent=2)
+
+        keyword_text = ", ".join(self._normalize_keywords(keywords))
+
+        try:
+            output = self._invoke_structured(
+                llm=self.text_llm,
+                prompt_template=SYNTHESIS_PROMPT,
+                payload={
+                    "text_analysis": text_payload,
+                    "vision_analysis": vision_payload,
+                    "relevance_score": relevance_score,
+                    "keywords": keyword_text,
+                },
+                output_model=SynthesisOutput,
             )
-            content = response.choices[0].message.content
-            # Post-processing to remove markdown code blocks if the model still includes them
-            content = content.replace("```markdown", "").replace("```", "").strip()
-            return content
-        except Exception as e:
-            return f"Error in synthesis: {e}"
+            return output.markdown.strip()
+        except Exception as exc:
+            # 合成失败时返回最小可读兜底，避免整篇报告中断。
+            return (
+                "## 1. Basic Information\n"
+                f"* **Relevance Score**: {relevance_score} / 10\n\n"
+                "## 2. Background\n"
+                "* **Core Motivation**: 解析失败。\n\n"
+                "## 3. Core Architecture and Method\n"
+                f"* **Method Description**: Synthesis failed: {exc}\n\n"
+                "## 4. Experimental Performance\n"
+                "* **Validation Tasks**: Unknown\n"
+                "* **Core Conclusion**: Unknown\n"
+            )

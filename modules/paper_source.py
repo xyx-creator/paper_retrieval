@@ -2,6 +2,9 @@ import requests
 import xml.etree.ElementTree as ET
 import time
 import os
+import re
+from html import unescape
+from urllib.parse import urljoin
 from config import ARXIV_CATEGORY, INPUT_DIR
 
 def search_arxiv(query_keywords, days=1):
@@ -538,6 +541,79 @@ def download_pdf(url, save_dir=INPUT_DIR):
     Downloads PDF from URL to save_dir.
     Returns the local file path.
     """
+    def _is_pdf_file(file_path):
+        """
+        通过文件头判断是否为真实 PDF。
+        仅检测魔术字 `%PDF`，可快速过滤掉被误存为 .pdf 的 HTML 页面。
+        """
+        try:
+            with open(file_path, "rb") as f:
+                return f.read(4) == b"%PDF"
+        except Exception:
+            return False
+
+    def _extract_pdf_url_from_html(html_text, base_url):
+        """
+        从期刊/会议落地页 HTML 中提取 PDF 链接。
+
+        常见来源：
+        1. `<meta name="citation_pdf_url" content="...">`
+        2. `href=".../article/download/..."`
+        3. `href="...pdf"`
+        """
+        # 先尝试最稳定的学术站点元标签（AAAI/OJS 常见）
+        meta_match = re.search(
+            r'<meta[^>]*name=["\']citation_pdf_url["\'][^>]*content=["\']([^"\']+)["\']',
+            html_text,
+            re.IGNORECASE,
+        )
+        if meta_match:
+            return urljoin(base_url, unescape(meta_match.group(1)))
+
+        # 其次尝试 article/download 风格链接
+        download_match = re.search(
+            r'href=["\']([^"\']*/article/download/[^"\']+)["\']',
+            html_text,
+            re.IGNORECASE,
+        )
+        if download_match:
+            return urljoin(base_url, unescape(download_match.group(1)))
+
+        # 最后兜底：任意看起来像 PDF 的链接
+        pdf_match = re.search(
+            r'href=["\']([^"\']*\.pdf(?:\?[^"\']*)?)["\']',
+            html_text,
+            re.IGNORECASE,
+        )
+        if pdf_match:
+            return urljoin(base_url, unescape(pdf_match.group(1)))
+
+        return None
+
+    def _download_once(target_url):
+        """
+        执行单次下载请求并返回：
+        - response
+        - 首块字节（用于检测 PDF 魔术字）
+        - 剩余字节流迭代器
+        """
+        headers = {
+            # 使用浏览器 UA，避免部分站点反爬直接 403
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/91.0.4472.124 Safari/537.36"
+            ),
+            # 主动表达优先接受 PDF，同时允许 HTML（用于抓落地页解析真实 PDF 链接）
+            "Accept": "application/pdf,text/html;q=0.9,*/*;q=0.8",
+        }
+        response = requests.get(target_url, headers=headers, stream=True, timeout=30, allow_redirects=True)
+        if response.status_code != 200:
+            return response, b"", None
+        iterator = response.iter_content(chunk_size=8192)
+        first_chunk = next(iterator, b"")
+        return response, first_chunk, iterator
+
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
         
@@ -562,37 +638,65 @@ def download_pdf(url, save_dir=INPUT_DIR):
     save_path = os.path.join(save_dir, filename)
     
     if os.path.exists(save_path):
-        # Check if empty (failed download)
-        if os.path.getsize(save_path) > 1024:
-             print(f"File already exists: {save_path}")
-             return save_path
-        else:
-             print(f"File exists but small/empty, re-downloading: {save_path}")
-             os.remove(save_path)
+        # 旧逻辑只看文件大小，可能把 HTML 误当 PDF 缓存。
+        # 新逻辑：只有“文件头是 %PDF 且大小合理”才直接复用。
+        if os.path.getsize(save_path) > 1024 and _is_pdf_file(save_path):
+            print(f"File already exists: {save_path}")
+            return save_path
+        print(f"Cached file invalid or too small, re-downloading: {save_path}")
+        try:
+            os.remove(save_path)
+        except Exception:
+            pass
         
     try:
         print(f"Downloading {url}...")
-        # Add headers to mimic browser to avoid 403 on some sites (AAAI, etc)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-        response = requests.get(url, headers=headers, stream=True, timeout=30)
-        
-        if response.status_code == 200:
-            with open(save_path, 'wb') as f:
-                for chunk in response.iter_content(1024):
-                    f.write(chunk)
-            
-            # Verify download size
-            if os.path.getsize(save_path) < 1000: # Less than 1KB is likely an error page
-                print(f"Warning: Downloaded file too small ({os.path.getsize(save_path)} bytes). Likely an error page.")
-                # Don't delete immediately, maybe inspect? Or treat as failure.
+
+        # 最多两轮跳转解析：
+        # 第 1 轮使用原 URL；若是 HTML 落地页，则解析出真实 PDF URL 再下第 2 轮。
+        current_url = url
+        for attempt in range(2):
+            response, first_chunk, iterator = _download_once(current_url)
+            if response.status_code != 200:
+                print(f"Failed to download {current_url}: {response.status_code}")
                 return None
-                
-            return save_path
-        else:
-            print(f"Failed to download {url}: {response.status_code}")
+
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            is_pdf = first_chunk.startswith(b"%PDF") or "application/pdf" in content_type
+
+            if is_pdf:
+                with open(save_path, "wb") as f:
+                    if first_chunk:
+                        f.write(first_chunk)
+                    if iterator:
+                        for chunk in iterator:
+                            if chunk:
+                                f.write(chunk)
+
+                # 二次校验：文件头必须是 PDF，避免 Content-Type 伪装。
+                if os.path.getsize(save_path) < 1000 or not _is_pdf_file(save_path):
+                    print(f"Warning: downloaded file is not a valid PDF: {save_path}")
+                    try:
+                        os.remove(save_path)
+                    except Exception:
+                        pass
+                    return None
+                return save_path
+
+            # 非 PDF：将响应体按 HTML 解析并提取下一跳 PDF 链接。
+            body = first_chunk + (b"".join(iterator) if iterator else b"")
+            html_text = body.decode("utf-8", errors="ignore")
+            pdf_url = _extract_pdf_url_from_html(html_text, response.url)
+
+            if pdf_url and pdf_url != current_url:
+                print(f"Resolved PDF URL from landing page: {pdf_url}")
+                current_url = pdf_url
+                continue
+
+            print(f"Landing page does not contain resolvable PDF link: {current_url}")
             return None
+
+        return None
     except Exception as e:
         print(f"Error downloading {url}: {e}")
         return None

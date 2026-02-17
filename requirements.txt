@@ -1,3 +1,6 @@
 pymupdf
 zhipuai
 pillow
+langchain
+langchain-community
+langgraph
