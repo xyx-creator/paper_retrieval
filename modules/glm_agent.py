@@ -12,7 +12,7 @@ import base64
 import json
 import mimetypes
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Type, TypeVar, Union
+from typing import Any, Dict, List, Optional, Sequence, Type, TypeVar, Union
 
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
@@ -245,22 +245,6 @@ class GLMAgent:
             if keyword not in result:
                 result[keyword] = [keyword]
         return result
-
-    def expand_keywords(self, keywords: Sequence[str], mode: str = "strict") -> List[str]:
-        """兼容旧接口：返回扁平化扩展词列表。"""
-
-        expansions = self.expand_keywords_batch(keywords=keywords, mode=mode)
-        flat: List[str] = []
-        for values in expansions.values():
-            flat.extend(values)
-        # 去重并保持顺序。
-        seen = set()
-        deduped: List[str] = []
-        for item in flat:
-            if item not in seen:
-                seen.add(item)
-                deduped.append(item)
-        return deduped
 
     def score_relevance(
         self,

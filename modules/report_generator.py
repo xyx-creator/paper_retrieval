@@ -1,12 +1,4 @@
 import os
-import shutil
-
-def generate_markdown_report(title, filename, score, image_path, synthesis, output_path):
-    """
-    DEPRECATED: Generates a Markdown report for a single paper.
-    Kept for backward compatibility if needed, but main workflow now uses consolidated report.
-    """
-    pass
 
 def generate_consolidated_report(results_list, output_path, keywords):
     """
@@ -78,20 +70,3 @@ def generate_consolidated_report(results_list, output_path, keywords):
         f.write(markdown_content)
     
     print(f"Consolidated report generated: {output_path}")
-
-def cleanup_temp_files(image_path):
-    """
-    Removes the temporary image file. 
-    Use this if we truly want to be 'stateless' and maybe embed image or just discard it.
-    But based on "relative path" requirement, we probably shouldn't delete the final image 
-    unless the report is self-contained (base64).
-    
-    Let's assume we DON'T delete the final image for now, but we would delete any other temp files.
-    Since we only generate one image per paper (the crop), maybe we keep it.
-    
-    If the user insists on "Stateless Cleanup", maybe they mean cleanup *after* the session or just intermediate files.
-    I will leave this function available but maybe not call it on the *result* image.
-    """
-    if os.path.exists(image_path):
-        os.remove(image_path)
-        print(f"Deleted temp file: {image_path}")

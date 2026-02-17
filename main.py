@@ -20,11 +20,9 @@ def _parse_csv_keywords(value: str | None) -> List[str]:
 def _build_user_query(args: argparse.Namespace) -> Dict[str, Any]:
     """根据命令行参数构造图输入的 `user_query`。"""
 
-    # mandatory：优先级 mandatory > keywords(兼容旧参数) > config 默认值
+    # mandatory：优先级 mandatory > config 默认值
     if args.mandatory:
         mandatory = _parse_csv_keywords(args.mandatory)
-    elif args.keywords:
-        mandatory = _parse_csv_keywords(args.keywords)
     else:
         mandatory = list(KEYWORDS.get("mandatory", []))
 
@@ -32,7 +30,7 @@ def _build_user_query(args: argparse.Namespace) -> Dict[str, Any]:
     if args.bonus:
         bonus = _parse_csv_keywords(args.bonus)
     else:
-        if not args.mandatory and not args.keywords:
+        if not args.mandatory:
             bonus = list(KEYWORDS.get("bonus", []))
         else:
             bonus = []
@@ -70,9 +68,6 @@ def build_parser() -> argparse.ArgumentParser:
     # 新参数：分层关键词
     parser.add_argument("--mandatory", type=str, help="逗号分隔的 mandatory 关键词")
     parser.add_argument("--bonus", type=str, help="逗号分隔的 bonus 关键词")
-
-    # 兼容参数：旧版 keywords 映射到 mandatory
-    parser.add_argument("--keywords", type=str, help="[兼容旧参数] 逗号分隔关键词")
 
     # 并发与筛选参数
     parser.add_argument("--max-workers", type=int, default=5, help="并行线程数")
@@ -131,4 +126,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

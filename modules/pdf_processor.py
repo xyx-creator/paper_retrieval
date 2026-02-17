@@ -200,7 +200,7 @@ def crop_specific_figure(pdf_path, target_figure_id, captions, output_dir=OUTPUT
     print(f"Saved crop to {output_path}")
     return output_path
 
-# Keep the old function for compatibility if needed, but we probably won't use it.
+# PDF 首页面文本信息抽取（供工作流节点与工具层调用）。
 def extract_text_and_metadata(pdf_path):
     """
     Extracts the title and abstract from the first page of the PDF using a robust method.
