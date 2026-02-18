@@ -1,14 +1,6 @@
-"""LangGraph 节点实现。
-
-设计原则：
-1. 编排层使用 LangGraph，核心处理逻辑仍复用原生模块；
-2. 所有 IO 密集流程保持并发（检索/下载/打分/深度分析）；
-3. 节点尽量返回“最小增量状态”，降低状态污染风险。
-"""
-
 from __future__ import annotations
 
-import concurrent.futures
+import asyncio
 import glob
 import os
 import re
@@ -38,22 +30,16 @@ from workflow.state import GraphState
 
 @lru_cache(maxsize=1)
 def _get_agent() -> GLMAgent:
-    """延迟初始化 GLM Agent，避免图编译阶段触发模型依赖。"""
-
     return GLMAgent()
 
 
 def _ensure_runtime_dirs() -> None:
-    """确保运行期目录存在。"""
-
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(os.path.join(OUTPUT_DIR, "images"), exist_ok=True)
 
 
 def _deduplicate_papers(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """按 title + url 去重，减少后续重复打分与重复下载。"""
-
     seen = set()
     deduped: List[Dict[str, Any]] = []
     for paper in papers:
@@ -68,8 +54,6 @@ def _deduplicate_papers(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _slugify_filename(text: str, max_len: int = 50) -> str:
-    """将论文标题/文件名转成安全目录名。"""
-
     text = os.path.splitext(text)[0]
     text = text.replace(" ", "_")
     text = re.sub(r"[^a-zA-Z0-9_]", "", text)
@@ -77,8 +61,6 @@ def _slugify_filename(text: str, max_len: int = 50) -> str:
 
 
 def _extract_fallback_intro_and_abstract(pdf_path: str) -> Tuple[str, str]:
-    """当 metadata 抽取不足时，从首页提取 fallback 文本。"""
-
     intro = ""
     fallback_abstract = ""
     try:
@@ -92,18 +74,14 @@ def _extract_fallback_intro_and_abstract(pdf_path: str) -> Tuple[str, str]:
 
 
 def _is_valid_pdf_file(file_path: str) -> bool:
-    """用文件头快速判断是否为有效 PDF。"""
-
     try:
-        with open(file_path, "rb") as f:
-            return f.read(4) == b"%PDF"
+        with open(file_path, "rb") as file:
+            return file.read(4) == b"%PDF"
     except Exception:
         return False
 
 
 def _build_report_filename(source: str, user_query: Dict[str, Any]) -> str:
-    """生成报告文件名，保持与原工程命名习惯接近。"""
-
     date_str = datetime.now().strftime("%Y-%m-%d")
     mandatory = user_query.get("mandatory_keywords") or []
     first_kw = mandatory[0].replace(" ", "-") if mandatory else "Papers"
@@ -115,9 +93,18 @@ def _build_report_filename(source: str, user_query: Dict[str, Any]) -> str:
     return f"{source_tag}_{first_kw}_{date_str}.md"
 
 
-def keyword_expansion_node(state: GraphState) -> Dict[str, Any]:
-    """Node 1: Keyword Expansion。"""
+def _read_text_file(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as file:
+        return file.read()
 
+
+def _write_text_file(path: str, content: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        file.write(content)
+
+
+async def keyword_expansion_node(state: GraphState) -> Dict[str, Any]:
     user_query = dict(state.get("user_query", {}))
     errors = list(state.get("errors", []))
 
@@ -128,15 +115,12 @@ def keyword_expansion_node(state: GraphState) -> Dict[str, Any]:
 
     try:
         agent = _get_agent()
-        expanded_mandatory = agent.expand_keywords_batch(mandatory, mode="strict")
+        expanded_mandatory = await agent.expand_keywords_batch(mandatory, mode="strict")
     except Exception as exc:
-        # 关键词扩展失败时，回退为“原词本身”，保证后续流程可继续。
         expanded_mandatory = {k: [k] for k in mandatory}
         errors.append(f"[Keyword Expansion] failed: {exc}")
 
-    # 与阶段一约定保持一致：bonus 默认不做扩展，直接透传。
     expanded_bonus = list(bonus)
-
     user_query["mandatory_keywords"] = mandatory
     user_query["bonus_keywords"] = expanded_bonus
 
@@ -148,15 +132,7 @@ def keyword_expansion_node(state: GraphState) -> Dict[str, Any]:
     }
 
 
-def information_retrieval_node(state: GraphState) -> Dict[str, Any]:
-    """Node 2: Information Retrieval。
-
-    并行策略说明：
-    - 对于 `source=all`，并行触发 arXiv 与 DBLP->S2 两条检索链；
-    - 对于单一来源，仍复用同一套工具调用逻辑；
-    - DBLP->S2 必须串行（后者依赖前者结果），但该链可以与其他来源并行。
-    """
-
+async def information_retrieval_node(state: GraphState) -> Dict[str, Any]:
     _ensure_runtime_dirs()
     user_query = dict(state.get("user_query", {}))
     errors = list(state.get("errors", []))
@@ -167,7 +143,6 @@ def information_retrieval_node(state: GraphState) -> Dict[str, Any]:
     year = user_query.get("year")
     max_local_papers = int(user_query.get("max_local_papers", 15))
 
-    # Local 模式直接读取本地 PDF 列表，不走网络检索。
     if source == "local":
         pdf_files = glob.glob(os.path.join(INPUT_DIR, "*.pdf"))
         pdf_files.sort(key=os.path.getmtime, reverse=True)
@@ -182,51 +157,45 @@ def information_retrieval_node(state: GraphState) -> Dict[str, Any]:
         ]
         return {"candidate_papers": candidate_papers, "errors": errors}
 
-    def fetch_arxiv_chain() -> List[Dict[str, Any]]:
+    async def fetch_arxiv_chain() -> List[Dict[str, Any]]:
         mandatory = user_query.get("mandatory_keywords", [])
-        return search_arxiv_tool.invoke(
+        return await search_arxiv_tool.ainvoke(
             {"query_keywords": mandatory, "days": days}
         )
 
-    def fetch_dblp_s2_chain() -> List[Dict[str, Any]]:
+    async def fetch_dblp_s2_chain() -> List[Dict[str, Any]]:
         if not venue or not year:
-            raise ValueError("DBLP 检索需要 venue 与 year。")
-        dblp_hits = search_dblp_tool.invoke({"venue": str(venue), "year": int(year)})
-        return batch_fetch_s2_tool.invoke({"papers_data": dblp_hits})
+            raise ValueError("DBLP retrieval requires both venue and year.")
+        dblp_hits = await search_dblp_tool.ainvoke(
+            {"venue": str(venue), "year": int(year)}
+        )
+        return await batch_fetch_s2_tool.ainvoke({"papers_data": dblp_hits})
+
+    chain_tasks: List[Tuple[str, Any]] = []
+    if source in {"arxiv", "all"}:
+        chain_tasks.append(("arxiv", fetch_arxiv_chain()))
+    if source in {"dblp", "all"}:
+        chain_tasks.append(("dblp_s2", fetch_dblp_s2_chain()))
 
     candidate_papers: List[Dict[str, Any]] = []
-    futures: Dict[concurrent.futures.Future, str] = {}
-
-    # 统一并发入口：即使只有一条链路也用同样的执行结构，便于扩展。
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        if source in {"arxiv", "all"}:
-            futures[executor.submit(fetch_arxiv_chain)] = "arxiv"
-        if source in {"dblp", "all"}:
-            futures[executor.submit(fetch_dblp_s2_chain)] = "dblp_s2"
-
-        if not futures:
-            errors.append(f"[Information Retrieval] unsupported source: {source}")
-
-        for future in concurrent.futures.as_completed(futures):
-            chain_name = futures[future]
-            try:
-                papers = future.result()
-                candidate_papers.extend(papers or [])
-            except Exception as exc:
-                errors.append(f"[Information Retrieval:{chain_name}] failed: {exc}")
+    if not chain_tasks:
+        errors.append(f"[Information Retrieval] unsupported source: {source}")
+    else:
+        results = await asyncio.gather(
+            *(task for _, task in chain_tasks),
+            return_exceptions=True,
+        )
+        for (chain_name, _), result in zip(chain_tasks, results):
+            if isinstance(result, Exception):
+                errors.append(f"[Information Retrieval:{chain_name}] failed: {result}")
+                continue
+            candidate_papers.extend(result or [])
 
     candidate_papers = _deduplicate_papers(candidate_papers)
     return {"candidate_papers": candidate_papers, "errors": errors}
 
 
-def filter_scoring_node(state: GraphState) -> Dict[str, Any]:
-    """Node 3: Filter & Scoring。
-
-    并行策略说明：
-    - 先进行轻量关键词过滤（同步）；
-    - 再对过滤后论文执行并行摘要打分（线程池）。
-    """
-
+async def filter_scoring_node(state: GraphState) -> Dict[str, Any]:
     user_query = dict(state.get("user_query", {}))
     errors = list(state.get("errors", []))
     source = str(user_query.get("source", "local")).lower()
@@ -235,7 +204,6 @@ def filter_scoring_node(state: GraphState) -> Dict[str, Any]:
     expanded_mandatory = dict(state.get("expanded_mandatory", {}))
     expanded_bonus = list(state.get("expanded_bonus", []))
 
-    # Local 模式不做 metadata 过滤/打分，留到深度分析时基于 PDF 内容再评估。
     if source == "local":
         return {
             "filtered_papers": candidate_papers,
@@ -247,7 +215,7 @@ def filter_scoring_node(state: GraphState) -> Dict[str, Any]:
         return {"filtered_papers": [], "scored_papers": [], "errors": errors}
 
     try:
-        filtered_papers = filter_by_keywords_tool.invoke(
+        filtered_papers = await filter_by_keywords_tool.ainvoke(
             {
                 "papers": candidate_papers,
                 "expanded_mandatory": expanded_mandatory,
@@ -270,36 +238,36 @@ def filter_scoring_node(state: GraphState) -> Dict[str, Any]:
             "scored_papers": [],
             "errors": errors,
         }
+
     threshold = int(user_query.get("relevance_threshold", RELEVANCE_THRESHOLD))
-    max_workers = int(user_query.get("max_workers", 5))
+    max_workers = max(1, int(user_query.get("max_workers", 5)))
     top_k = int(user_query.get("top_k", 10))
     mandatory = user_query.get("mandatory_keywords", [])
     bonus = user_query.get("bonus_keywords", [])
+    semaphore = asyncio.Semaphore(max_workers)
 
-    def score_single(paper: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        abstract = str(paper.get("abstract", ""))
-        score = agent.score_relevance(abstract, mandatory, bonus)
-        if score < threshold:
-            return None
-        enriched = dict(paper)
-        enriched["score"] = score
-        return enriched
+    async def score_single(paper: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        async with semaphore:
+            abstract = str(paper.get("abstract", ""))
+            score = await agent.score_relevance(abstract, mandatory, bonus)
+            if score < threshold:
+                return None
+            enriched = dict(paper)
+            enriched["score"] = score
+            return enriched
 
     scored_papers: List[Dict[str, Any]] = []
-    # 评分是典型 IO-bound（模型请求），线程池可以显著降低总耗时。
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_paper = {
-            executor.submit(score_single, paper): paper for paper in filtered_papers
-        }
-        for future in concurrent.futures.as_completed(future_to_paper):
-            paper = future_to_paper[future]
-            try:
-                result = future.result()
-                if result:
-                    scored_papers.append(result)
-            except Exception as exc:
-                title = str(paper.get("title", ""))[:80]
-                errors.append(f"[Scoring] failed on `{title}`: {exc}")
+    outcomes = await asyncio.gather(
+        *(score_single(paper) for paper in filtered_papers),
+        return_exceptions=True,
+    )
+    for paper, outcome in zip(filtered_papers, outcomes):
+        if isinstance(outcome, Exception):
+            title = str(paper.get("title", ""))[:80]
+            errors.append(f"[Scoring] failed on `{title}`: {outcome}")
+            continue
+        if outcome:
+            scored_papers.append(outcome)
 
     scored_papers.sort(key=lambda x: x.get("score", 0), reverse=True)
     scored_papers = scored_papers[:top_k]
@@ -310,18 +278,10 @@ def filter_scoring_node(state: GraphState) -> Dict[str, Any]:
     }
 
 
-def _process_single_paper(
+async def _process_single_paper(
     paper_info: Dict[str, Any],
     user_query: Dict[str, Any],
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Node4 的单论文处理函数（供线程池并行调用）。
-
-    线程安全说明：
-    - 本函数不写共享全局变量；
-    - 每个线程只处理一个 paper_info，并返回结果给主线程汇总；
-    - 避免在子线程直接 append 共享列表，从根源减少锁竞争和竞态。
-    """
-
     title_for_log = str(paper_info.get("title", "Unknown Title"))
 
     try:
@@ -335,50 +295,62 @@ def _process_single_paper(
             url = paper_info.get("url")
             if not url:
                 return None, f"[Deep Analysis] `{title_for_log}` missing PDF url."
-            pdf_path = download_pdf_tool.invoke({"url": str(url), "save_dir": INPUT_DIR})
+            pdf_path = await download_pdf_tool.ainvoke(
+                {"url": str(url), "save_dir": INPUT_DIR}
+            )
 
         if not pdf_path or not os.path.exists(pdf_path):
             return None, f"[Deep Analysis] `{title_for_log}` download/open pdf failed."
 
-        # 防止历史缓存中存在“扩展名是 .pdf 但实际是 HTML”的脏文件。
-        # 若当前论文有 URL，则尝试重新下载一次；否则直接跳过并记录原因。
-        if not _is_valid_pdf_file(pdf_path):
+        is_valid_pdf = await asyncio.to_thread(_is_valid_pdf_file, pdf_path)
+        if not is_valid_pdf:
             paper_url = paper_info.get("url")
             if paper_url:
-                re_downloaded = download_pdf_tool.invoke({"url": str(paper_url), "save_dir": INPUT_DIR})
-                if re_downloaded and os.path.exists(re_downloaded) and _is_valid_pdf_file(re_downloaded):
+                re_downloaded = await download_pdf_tool.ainvoke(
+                    {"url": str(paper_url), "save_dir": INPUT_DIR}
+                )
+                if (
+                    re_downloaded
+                    and os.path.exists(re_downloaded)
+                    and await asyncio.to_thread(_is_valid_pdf_file, re_downloaded)
+                ):
                     pdf_path = re_downloaded
                 else:
-                    return None, f"[Deep Analysis] `{title_for_log}` invalid PDF content (non-PDF body)."
+                    return (
+                        None,
+                        f"[Deep Analysis] `{title_for_log}` invalid PDF content (non-PDF body).",
+                    )
             else:
                 return None, f"[Deep Analysis] `{title_for_log}` invalid local PDF content."
 
         filename = os.path.basename(pdf_path)
 
-        # 1) 文本元数据抽取（调用工具封装，底层仍是原生实现）。
-        raw_metadata = extract_text_and_metadata_tool.invoke({"pdf_path": pdf_path})
+        raw_metadata = await extract_text_and_metadata_tool.ainvoke({"pdf_path": pdf_path})
         title = raw_metadata.get("title") or filename
         abstract = raw_metadata.get("abstract") or str(paper_info.get("abstract", ""))
 
-        # 当摘要不足时，回退首页文本，提升后续打分与文本脑稳定性。
         first_page_text = ""
         if not abstract or len(abstract) < 100:
-            first_page_text, fallback_abstract = _extract_fallback_intro_and_abstract(pdf_path)
+            first_page_text, fallback_abstract = await asyncio.to_thread(
+                _extract_fallback_intro_and_abstract,
+                pdf_path,
+            )
             if fallback_abstract:
                 abstract = fallback_abstract
         else:
-            first_page_text, _ = _extract_fallback_intro_and_abstract(pdf_path)
+            first_page_text, _ = await asyncio.to_thread(
+                _extract_fallback_intro_and_abstract,
+                pdf_path,
+            )
 
-        # 2) 相关性分数：在线检索场景复用 Node3 结果；本地模式在这里补算。
         score = paper_info.get("score")
         if score is None:
-            score = agent.score_relevance(abstract, mandatory, bonus)
+            score = await agent.score_relevance(abstract, mandatory, bonus)
         score = int(score)
         if score < threshold:
             return None, None
 
-        # 3) 图注抽取 + 结构图选择。
-        captions = extract_all_captions_tool.invoke({"pdf_path": pdf_path})
+        captions = await extract_all_captions_tool.ainvoke({"pdf_path": pdf_path})
         if not captions:
             return None, None
 
@@ -386,16 +358,15 @@ def _process_single_paper(
             f"{c.get('figure_id', '')}: {str(c.get('caption_text', ''))[:200]}..."
             for c in captions
         ]
-        best_figure_id = agent.select_best_figure(captions_text_list)
+        best_figure_id = await agent.select_best_figure(captions_text_list)
         if not best_figure_id:
             return None, f"[Deep Analysis] `{title_for_log}` no suitable figure selected."
 
-        # 4) 构造论文专属图像目录，避免不同论文输出冲突。
         paper_slug = _slugify_filename(filename)
         paper_image_dir = os.path.join(OUTPUT_DIR, "images", paper_slug)
         os.makedirs(paper_image_dir, exist_ok=True)
 
-        image_path = crop_specific_figure_tool.invoke(
+        image_path = await crop_specific_figure_tool.ainvoke(
             {
                 "pdf_path": pdf_path,
                 "target_figure_id": best_figure_id,
@@ -404,12 +375,17 @@ def _process_single_paper(
             }
         )
         if not image_path or not os.path.exists(image_path):
-            return None, f"[Deep Analysis] `{title_for_log}` figure crop failed for {best_figure_id}."
+            return (
+                None,
+                f"[Deep Analysis] `{title_for_log}` figure crop failed for {best_figure_id}.",
+            )
 
-        # 5) 双脑分析 + 融合报告。
-        text_analysis = agent.analyze_text_brain(abstract, introduction=first_page_text)
-        vision_analysis = agent.analyze_vision_brain(image_path)
-        synthesis = agent.synthesize_report(
+        text_analysis = await agent.analyze_text_brain(
+            abstract,
+            introduction=first_page_text,
+        )
+        vision_analysis = await agent.analyze_vision_brain(image_path)
+        synthesis = await agent.synthesize_report(
             text_analysis=text_analysis,
             vision_analysis=vision_analysis,
             relevance_score=score,
@@ -430,9 +406,7 @@ def _process_single_paper(
         return None, f"[Deep Analysis] `{title_for_log}` failed: {exc}"
 
 
-def deep_analysis_node(state: GraphState) -> Dict[str, Any]:
-    """Node 4: Deep Analysis (Dual-Brain)。"""
-
+async def deep_analysis_node(state: GraphState) -> Dict[str, Any]:
     _ensure_runtime_dirs()
     user_query = dict(state.get("user_query", {}))
     errors = list(state.get("errors", []))
@@ -445,34 +419,36 @@ def deep_analysis_node(state: GraphState) -> Dict[str, Any]:
     if not papers_to_process:
         return {"processed_papers": [], "errors": errors}
 
-    max_workers = int(user_query.get("max_workers", 5))
+    max_workers = max(1, int(user_query.get("max_workers", 5)))
+    semaphore = asyncio.Semaphore(max_workers)
     processed_papers: List[Dict[str, Any]] = []
 
-    # 多论文并行处理：每个 future 对应一篇论文的完整深度分析流水线。
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_paper = {
-            executor.submit(_process_single_paper, paper, user_query): paper
-            for paper in papers_to_process
-        }
+    async def process_with_limit(paper: Dict[str, Any]):
+        async with semaphore:
+            return await _process_single_paper(paper, user_query)
 
-        for future in concurrent.futures.as_completed(future_to_paper):
-            try:
-                result, err = future.result()
-                if result:
-                    processed_papers.append(result)
-                if err:
-                    errors.append(err)
-            except Exception as exc:
-                title = str(future_to_paper[future].get("title", "Unknown Title"))
-                errors.append(f"[Deep Analysis] `{title}` thread failed: {exc}")
+    outcomes = await asyncio.gather(
+        *(process_with_limit(paper) for paper in papers_to_process),
+        return_exceptions=True,
+    )
+
+    for paper, outcome in zip(papers_to_process, outcomes):
+        if isinstance(outcome, Exception):
+            title = str(paper.get("title", "Unknown Title"))
+            errors.append(f"[Deep Analysis] `{title}` task failed: {outcome}")
+            continue
+
+        result, err = outcome
+        if result:
+            processed_papers.append(result)
+        if err:
+            errors.append(err)
 
     processed_papers.sort(key=lambda x: x.get("score", 0), reverse=True)
     return {"processed_papers": processed_papers, "errors": errors}
 
 
-def report_generation_node(state: GraphState) -> Dict[str, Any]:
-    """Node 5: Report Generation。"""
-
+async def report_generation_node(state: GraphState) -> Dict[str, Any]:
     _ensure_runtime_dirs()
     user_query = dict(state.get("user_query", {}))
     errors = list(state.get("errors", []))
@@ -486,31 +462,29 @@ def report_generation_node(state: GraphState) -> Dict[str, Any]:
     report_path = os.path.join(OUTPUT_DIR, report_filename)
 
     if processed_papers:
-        generate_consolidated_report(
-            results_list=processed_papers,
-            output_path=report_path,
-            keywords=keywords_text,
+        await asyncio.to_thread(
+            generate_consolidated_report,
+            processed_papers,
+            report_path,
+            keywords_text,
         )
         try:
-            with open(report_path, "r", encoding="utf-8") as f:
-                final_report = f.read()
+            final_report = await asyncio.to_thread(_read_text_file, report_path)
         except Exception:
             final_report = ""
     else:
-        # 空结果也输出报告文件，便于自动化任务统一消费。
         final_report = (
             "# Paper Analysis Report\n\n"
             f"**Keywords:** {keywords_text or 'N/A'}\n"
             f"**Date:** {datetime.now().strftime('%Y-%m-%d')}\n\n"
             "## Result\n\n"
-            "未筛选到满足条件的论文，或深度分析阶段未产生有效结果。\n"
+            "No papers passed filtering, or deep analysis produced no usable output.\n"
         )
-        os.makedirs(os.path.dirname(report_path), exist_ok=True)
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write(final_report)
+        await asyncio.to_thread(_write_text_file, report_path, final_report)
 
     return {
         "final_report": final_report,
         "report_path": report_path,
         "errors": errors,
     }
+
