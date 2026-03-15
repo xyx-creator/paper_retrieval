@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="local",
         help="Paper source: local/arxiv/dblp/all",
     )
-    parser.add_argument("--days", type=int, default=1, help="arXiv lookback days")
+    parser.add_argument("--days", type=int, default=3, help="arXiv lookback days")
     parser.add_argument("--venue", type=str, help="DBLP venue, e.g. CVPR")
     parser.add_argument("--year", type=int, help="DBLP year, e.g. 2025")
     parser.add_argument(

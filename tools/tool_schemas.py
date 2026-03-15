@@ -19,7 +19,7 @@ class SearchArxivInput(BaseModel):
     query_keywords: List[str] = Field(
         ..., min_length=1, description="检索关键词列表，例如 ['Vision-Language Models', 'Hallucination']。"
     )
-    days: int = Field(default=1, ge=1, le=30, description="仅检索最近 N 天内的论文。")
+    days: int = Field(default=3, ge=1, le=30, description="仅检索最近 N 天内的论文。")
 
 
 class SearchDblpInput(BaseModel):

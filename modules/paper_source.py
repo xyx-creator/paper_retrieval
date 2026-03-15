@@ -16,7 +16,7 @@ import httpx
 from config import ARXIV_CATEGORY, INPUT_DIR, S2_API_KEY
 
 
-async def search_arxiv(query_keywords: Sequence[str], days: int = 1) -> List[Dict[str, Any]]:
+async def search_arxiv(query_keywords: Sequence[str], days: int = 3) -> List[Dict[str, Any]]:
     """
     Search arXiv for papers matching query_keywords within the last N days.
     """

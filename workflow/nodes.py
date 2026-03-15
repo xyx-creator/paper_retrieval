@@ -138,7 +138,7 @@ async def information_retrieval_node(state: GraphState) -> Dict[str, Any]:
     errors = list(state.get("errors", []))
 
     source = str(user_query.get("source", "local")).lower()
-    days = int(user_query.get("days", 1))
+    days = int(user_query.get("days", 3))
     venue = user_query.get("venue")
     year = user_query.get("year")
     max_local_papers = int(user_query.get("max_local_papers", 15))
@@ -204,15 +204,42 @@ async def filter_scoring_node(state: GraphState) -> Dict[str, Any]:
     expanded_mandatory = dict(state.get("expanded_mandatory", {}))
     expanded_bonus = list(state.get("expanded_bonus", []))
 
-    if source == "local":
-        return {
-            "filtered_papers": candidate_papers,
-            "scored_papers": candidate_papers,
-            "errors": errors,
-        }
-
     if not candidate_papers:
         return {"filtered_papers": [], "scored_papers": [], "errors": errors}
+
+    if source == "local":
+        max_workers = max(1, int(user_query.get("max_workers", 5)))
+        semaphore = asyncio.Semaphore(max_workers)
+
+        async def enrich_local_paper(paper: Dict[str, Any]) -> Dict[str, Any]:
+            local_path = str(paper.get("local_path", ""))
+            if not local_path or not os.path.exists(local_path):
+                return paper
+
+            async with semaphore:
+                try:
+                    metadata = await extract_text_and_metadata_tool.ainvoke(
+                        {"pdf_path": local_path}
+                    )
+                except Exception as exc:
+                    title_for_log = str(paper.get("title", os.path.basename(local_path)))
+                    errors.append(f"[Local Metadata] `{title_for_log}` failed: {exc}")
+                    return paper
+
+            enriched = dict(paper)
+            title = str(metadata.get("title", "")).strip()
+            abstract = str(metadata.get("abstract", "")).strip()
+            if title:
+                enriched["title"] = title
+            if abstract:
+                enriched["abstract"] = abstract
+            return enriched
+
+        enriched_candidates = await asyncio.gather(
+            *(enrich_local_paper(paper) for paper in candidate_papers),
+            return_exceptions=False,
+        )
+        candidate_papers = list(enriched_candidates)
 
     try:
         filtered_papers = await filter_by_keywords_tool.ainvoke(
@@ -228,6 +255,13 @@ async def filter_scoring_node(state: GraphState) -> Dict[str, Any]:
 
     if not filtered_papers:
         return {"filtered_papers": [], "scored_papers": [], "errors": errors}
+
+    if source == "local":
+        return {
+            "filtered_papers": filtered_papers,
+            "scored_papers": filtered_papers,
+            "errors": errors,
+        }
 
     try:
         agent = _get_agent()
@@ -414,7 +448,7 @@ async def deep_analysis_node(state: GraphState) -> Dict[str, Any]:
 
     papers_to_process = list(state.get("scored_papers", []))
     if source == "local" and not papers_to_process:
-        papers_to_process = list(state.get("candidate_papers", []))
+        papers_to_process = list(state.get("filtered_papers", []))
 
     if not papers_to_process:
         return {"processed_papers": [], "errors": errors}

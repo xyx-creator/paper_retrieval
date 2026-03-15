@@ -23,7 +23,7 @@ from tools.tool_schemas import (
 @tool("search_arxiv", args_schema=SearchArxivInput)
 async def search_arxiv_tool(
     query_keywords: List[str],
-    days: int = 1,
+    days: int = 3,
 ) -> List[Dict[str, Any]]:
     return await _search_arxiv(query_keywords=query_keywords, days=days)
 
