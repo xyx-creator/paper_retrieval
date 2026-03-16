@@ -6,11 +6,20 @@ import argparse
 import asyncio
 
 from agent_runner import process_user_query
+from langchain_core.messages import HumanMessage
+from workflow.multi_agent_graph import MULTI_AGENT_APP
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Paper Retrieval ReAct Agent (LangGraph prebuilt)"
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["react", "multi-agent"],
+        default="react",
+        help="Execution mode: react (default) or multi-agent",
     )
     parser.add_argument(
         "--query",
@@ -24,9 +33,31 @@ def build_parser() -> argparse.ArgumentParser:
 async def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    result = await process_user_query(args.query)
+
+    if args.mode == "react":
+        result = await process_user_query(args.query)
+        print("\nExecution Complete!")
+        print(f"Final answer: {result['final_answer']}")
+        return
+
+    initial_state = {
+        "task_instruction": args.query,
+        "retrieved_papers": [],
+        "downloaded_pdfs": [],
+        "visual_assets": [],
+        "final_report": "",
+        "messages": [HumanMessage(content=args.query)],
+        "errors": [],
+    }
+    result = await MULTI_AGENT_APP.ainvoke(initial_state)
+
     print("\nExecution Complete!")
-    print(f"Final answer: {result['final_answer']}")
+    print("Final report:")
+    print(result.get("final_report", ""))
+    if result.get("errors"):
+        print("\nErrors:")
+        for err in result["errors"]:
+            print(f"- {err}")
 
 
 if __name__ == "__main__":

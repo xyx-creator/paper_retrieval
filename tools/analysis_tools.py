@@ -23,7 +23,7 @@ _ANALYSIS_SESSIONS: Dict[str, List[Dict[str, Any]]] = {}
 @tool("list_local_pdfs", args_schema=ListLocalPdfsInput)
 async def list_local_pdfs_tool(
     folder_path: str = "paper",
-    recursive: bool = False,
+    recursive: int | bool = False,
     max_files: int = 8,
 ) -> Dict[str, Any]:
     """List local PDF files under a folder for downstream analyze_pdf calls."""
@@ -37,7 +37,9 @@ async def list_local_pdfs_tool(
         }
 
     pdf_paths: List[str] = []
-    if recursive:
+    recursive_flag = bool(recursive)
+
+    if recursive_flag:
         for root, _, files in os.walk(folder_abs):
             for file_name in files:
                 if file_name.lower().endswith(".pdf"):
@@ -76,7 +78,7 @@ def _extract_first_page_text(pdf_path: str) -> str:
         doc = fitz.open(pdf_path)
         text = doc[0].get_text("text")
         doc.close()
-        return text
+        return str(text)
     except Exception:
         return ""
 

@@ -25,6 +25,21 @@ REACT_SYSTEM_PROMPT = (
     "Do not call remote search tools (search_arxiv/search_dblp) for local-only requests unless the user explicitly asks remote retrieval."
 )
 
+REMOTE_RETRIEVAL_TOOL_NAMES = {
+    "search_arxiv",
+    "search_dblp",
+    "batch_fetch_s2",
+}
+
+
+def _is_local_only_query(query: str) -> bool:
+    text = query.lower()
+    local_hints = ["local", "paper folder", "under paper", "pdf at", "local pdf", "on disk"]
+    remote_hints = ["arxiv", "dblp", "semantic scholar", "s2", "online", "web"]
+    has_local = any(token in text for token in local_hints)
+    has_remote = any(token in text for token in remote_hints)
+    return has_local and not has_remote
+
 
 def _build_chat_model(model_name: str = "glm-4-plus", temperature: float = 0.1):
     """Build a ChatZhipuAI instance with compatible constructor args."""
@@ -74,11 +89,20 @@ async def process_user_query(query: str) -> Dict[str, Any]:
     """Run a single natural-language query through a ReAct agent and stream progress."""
     model_name = "glm-4-plus"
     model = _build_chat_model(model_name=model_name, temperature=0.1)
-    agent_executor = create_react_agent(model, ALL_TOOLS, prompt=REACT_SYSTEM_PROMPT)
+    enabled_tools = list(ALL_TOOLS)
+    if _is_local_only_query(query):
+        enabled_tools = [
+            tool
+            for tool in ALL_TOOLS
+            if getattr(tool, "name", "") not in REMOTE_RETRIEVAL_TOOL_NAMES
+        ]
+        print("[Policy] Local-only query detected. Remote retrieval tools disabled.")
+
+    agent_executor = create_react_agent(model, enabled_tools, prompt=REACT_SYSTEM_PROMPT)
 
     print("Initializing ReAct tool-calling agent...")
     print(f"[Model] {model_name}")
-    print(f"[Tools] {len(ALL_TOOLS)} registered")
+    print(f"[Tools] {len(enabled_tools)} registered")
     print(f"\n[User Query] {query}\n")
 
     emitted_ids: set[str] = set()

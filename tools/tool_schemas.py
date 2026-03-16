@@ -49,7 +49,10 @@ class ListLocalPdfsInput(BaseModel):
         min_length=1,
         description="本地 PDF 目录路径，默认 paper。",
     )
-    recursive: bool = Field(default=False, description="是否递归扫描子目录。")
+    recursive: int | bool = Field(
+        default=False,
+        description="是否递归扫描子目录。支持 true/false；若传入整数，0=否，非0=是。",
+    )
     max_files: int = Field(default=8, ge=1, le=500, description="最多返回文件数。")
 
 
