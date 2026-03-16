@@ -20,6 +20,12 @@ class SearchArxivInput(BaseModel):
         ..., min_length=1, description="检索关键词列表，例如 ['Vision-Language Models', 'Hallucination']。"
     )
     days: int = Field(default=3, ge=1, le=30, description="仅检索最近 N 天内的论文。")
+    max_results: int = Field(
+        default=30,
+        ge=1,
+        le=200,
+        description="返回结果上限，避免上下文过长。",
+    )
 
 
 class SearchDblpInput(BaseModel):
@@ -27,6 +33,24 @@ class SearchDblpInput(BaseModel):
 
     venue: str = Field(..., min_length=1, description="会议/期刊简称或名称，例如 CVPR。")
     year: int = Field(..., ge=1900, le=2100, description="目标年份，例如 2025。")
+    max_results: int = Field(
+        default=100,
+        ge=1,
+        le=500,
+        description="返回结果上限，避免上下文过长。",
+    )
+
+
+class ListLocalPdfsInput(BaseModel):
+    """本地 PDF 列举参数。"""
+
+    folder_path: str = Field(
+        default="paper",
+        min_length=1,
+        description="本地 PDF 目录路径，默认 paper。",
+    )
+    recursive: bool = Field(default=False, description="是否递归扫描子目录。")
+    max_files: int = Field(default=8, ge=1, le=500, description="最多返回文件数。")
 
 
 class BatchFetchS2Input(BaseModel):
@@ -109,5 +133,52 @@ class CropSpecificFigureInput(BaseModel):
     )
     output_dir: Optional[str] = Field(
         default=None, description="裁剪图保存目录；为空时使用系统默认 OUTPUT_DIR。"
+    )
+
+
+class AnalyzePdfInput(BaseModel):
+    """单篇 PDF 深度分析参数。"""
+
+    pdf_path: str = Field(..., min_length=1, description="待分析 PDF 的本地路径。")
+    mandatory_keywords: List[str] = Field(
+        default_factory=list,
+        description="核心关键词列表，用于相关性评分和总结聚焦。",
+    )
+    bonus_keywords: List[str] = Field(
+        default_factory=list,
+        description="可选加分关键词列表。",
+    )
+    relevance_threshold: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description="最低相关性阈值。默认 1，避免误跳过分析。",
+    )
+    session_id: str = Field(
+        default="default",
+        min_length=1,
+        description="分析会话 ID。生成报告时按该会话聚合结果。",
+    )
+
+
+class GenerateMarkdownReportInput(BaseModel):
+    """Markdown 报告生成参数。"""
+
+    session_id: str = Field(
+        default="default",
+        min_length=1,
+        description="用于聚合分析结果的会话 ID。",
+    )
+    keywords: List[str] = Field(
+        default_factory=list,
+        description="报告头部展示的关键词列表。",
+    )
+    output_filename: Optional[str] = Field(
+        default=None,
+        description="输出 markdown 文件名，例如 cvpr_2024_report.md。为空时自动命名。",
+    )
+    clear_session_after_report: bool = Field(
+        default=False,
+        description="生成报告后是否清空该会话缓存。",
     )
 

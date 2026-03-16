@@ -24,13 +24,20 @@ from tools.tool_schemas import (
 async def search_arxiv_tool(
     query_keywords: List[str],
     days: int = 3,
+    max_results: int = 30,
 ) -> List[Dict[str, Any]]:
-    return await _search_arxiv(query_keywords=query_keywords, days=days)
+    results = await _search_arxiv(query_keywords=query_keywords, days=days)
+    return results[: max(1, int(max_results))]
 
 
 @tool("search_dblp", args_schema=SearchDblpInput)
-async def search_dblp_tool(venue: str, year: int) -> List[Dict[str, Any]]:
-    return await _search_dblp(venue=venue, year=year)
+async def search_dblp_tool(
+    venue: str,
+    year: int,
+    max_results: int = 100,
+) -> List[Dict[str, Any]]:
+    results = await _search_dblp(venue=venue, year=year)
+    return results[: max(1, int(max_results))]
 
 
 @tool("batch_fetch_s2", args_schema=BatchFetchS2Input)

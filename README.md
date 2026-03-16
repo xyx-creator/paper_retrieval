@@ -28,32 +28,38 @@ Main entry is `main.py`.
 C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py [ARGS]
 ```
 
-### 1) Local Mode
+### ReAct Dynamic Mode
 
-Analyze local PDFs under `paper/`.
+Use a free-text query and let the agent decide which tools to call.
 
 ```powershell
-C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --source local --mandatory "Vision Language Models,training-free" --top-k 10
+C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --query "Help me find two papers about CVPR 2024 and download the first one"
 ```
 
-### 2) arXiv Mode
-
-Retrieve from arXiv (default `--days` is 3).
+If you also want deep analysis and markdown report generation, ask explicitly in query:
 
 ```powershell
-C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --source arxiv --mandatory "Vision Language Models,training-free" --days 3 --top-k 10
+C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --query "Find two CVPR 2024 papers, download one, analyze the PDF, and generate a markdown report"
 ```
 
-### 3) DBLP Mode (e.g. CVPR 2025)
+### More Examples
 
-Retrieve from DBLP and enrich via Semantic Scholar.
+Search arXiv and then filter with natural language:
 
 ```powershell
-C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --source dblp --venue CVPR --year 2025 --mandatory "Vision Language Models,training-free" --top-k 10
+C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --query "Search arXiv for recent vision-language model papers from the last 3 days"
+```
+
+Search DBLP by venue/year intent and download PDF:
+
+```powershell
+C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --query "Find CVPR 2025 papers on training-free hallucination mitigation and download one PDF"
 ```
 
 Notes:
-- `--source dblp` requires both `--venue` and `--year`.
+- Core input argument is now `--query`.
+- Agent behavior is dynamic and no longer constrained by a fixed step-by-step DAG route.
+- When query includes analysis/report intent, agent can use `analyze_pdf` + `generate_markdown_report` tools.
 - Reports are written to `output/`.
 - Generated figure crops are written to `output/images/`.
 
