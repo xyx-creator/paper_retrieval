@@ -1,72 +1,120 @@
-# paper_retrieval
+# Paper Retrieval
 
-## Environment Setup (Conda)
+This repository provides a paper retrieval and analysis system with three completed phases:
 
-This project uses the conda environment `pr`.
+1. Plan 1: MCP infrastructure decoupling.
+2. Plan 2: ReAct agent with dynamic tool routing.
+3. Plan 3: Multi-agent architecture (Researcher -> Vision Expert -> Writer).
+
+## Current Status
+
+All 3 plans are completed and integrated.
+
+## Environment Setup
+
+This project uses conda environment `pr`.
 
 ```powershell
 conda activate pr
-```
-
-Install dependencies:
-
-```powershell
 python -m pip install -r requirements.txt
 ```
 
-If you want to avoid interpreter ambiguity, you can always use the full path:
+If needed, use a fixed interpreter path:
 
 ```powershell
 C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --help
 ```
 
-## Run Program
+## Architecture Overview
 
-Main entry is `main.py`.
+### Plan 1: MCP Server
+
+- MCP server entry: `mcp_server.py`
+- Server name: `PaperBrain`
+- Exposed MCP tools include:
+	- `search_arxiv_tool`
+	- `search_dblp_tool`
+	- `download_and_extract_captions_tool`
+	- `crop_figure_tool`
+
+Run MCP server:
+
+```powershell
+C:/Users/lenovo/anaconda3/envs/pr/python.exe mcp_server.py
+```
+
+### Plan 2: ReAct Dynamic Routing
+
+- Runtime core: `agent_runner.py`
+- Main entry: `main.py`
+- ReAct builds on `create_react_agent` with `ALL_TOOLS`
+- Streaming logs include Thought / Action / Observation / Final Answer
+
+### Plan 3: Multi-Agent Workflow
+
+- State: `workflow/multi_agent_state.py`
+- Nodes: `workflow/multi_agent_nodes.py`
+- Graph: `workflow/multi_agent_graph.py`
+- Runtime handoff logs:
+	- `[Researcher Agent working...]`
+	- `[Vision Expert Agent working...]`
+	- `[Writer Agent working...]`
+
+## Run Modes
+
+Main program entry is `main.py`.
 
 ```powershell
 C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py [ARGS]
 ```
 
-### ReAct Dynamic Mode
-
-Use a free-text query and let the agent decide which tools to call.
-
-```powershell
-C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --query "Help me find two papers about CVPR 2024 and download the first one"
-```
-
-If you also want deep analysis and markdown report generation, ask explicitly in query:
-
-```powershell
-C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --query "Find two CVPR 2024 papers, download one, analyze the PDF, and generate a markdown report"
-```
-
-### More Examples
-
-Search arXiv and then filter with natural language:
+### Mode 1: ReAct (default)
 
 ```powershell
 C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --query "Search arXiv for recent vision-language model papers from the last 3 days"
 ```
 
-Search DBLP by venue/year intent and download PDF:
+### Mode 2: Multi-Agent
 
 ```powershell
-C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --query "Find CVPR 2025 papers on training-free hallucination mitigation and download one PDF"
+C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --mode multi-agent --query "Search arXiv for Vision-Language Models and Hallucination papers from last 3 days, then create a concise report"
 ```
 
-Notes:
-- Core input argument is now `--query`.
-- Agent behavior is dynamic and no longer constrained by a fixed step-by-step DAG route.
-- When query includes analysis/report intent, agent can use `analyze_pdf` + `generate_markdown_report` tools.
-- Reports are written to `output/`.
-- Generated figure crops are written to `output/images/`.
+## Local vs Remote Retrieval Policy
 
-## Tests
+The current behavior is:
 
-Run unit tests (no external API calls required):
+1. Local intent is local-only.
+	 - For local queries, remote retrieval tools are disabled in ReAct mode.
+	 - In multi-agent mode, local intent processes local PDFs directly.
+2. Remote retrieval is used when query intent is arXiv/DBLP/online retrieval.
+3. Both modes still support report generation after analysis.
 
-```bash
+Local query example:
+
+```powershell
+C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --query "Analyze local PDFs under paper folder about Vision-Language Models and training-free, then generate one markdown report named react_local_training_free.md"
+```
+
+Remote query examples:
+
+```powershell
+C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --query "Search arXiv for recent Vision-Language Model papers from last 3 days, download the first one, analyze it, and generate one markdown report named arxiv_mode_report.md"
+
+C:/Users/lenovo/anaconda3/envs/pr/python.exe main.py --query "Find CVPR 2025 papers from DBLP, download the first available PDF, analyze it with keywords Vision-Language Models and Hallucination, and generate one markdown report named dblp_mode_report.md"
+```
+
+## Outputs
+
+- Markdown reports are written to `output/`
+- Extracted/cropped figures are written to `output/images/`
+
+## Validation
+
+Run unit tests:
+
+```powershell
 C:/Users/lenovo/anaconda3/envs/pr/python.exe -m unittest discover -s tests -v
 ```
+
+Recent validation confirms tests pass in conda environment `pr`.
